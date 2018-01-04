@@ -19,20 +19,10 @@
 package org.deeplearning4j.nn.conf.layers;
 
 import lombok.*;
-import org.deeplearning4j.nn.api.Layer;
-import org.deeplearning4j.nn.api.ParamInitializer;
-import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
-import org.deeplearning4j.nn.params.GravesLSTMParamInitializer;
 import org.deeplearning4j.nn.params.LSTMParamInitializer;
-import org.deeplearning4j.optimize.api.IterationListener;
-import org.deeplearning4j.util.LayerValidation;
 import org.nd4j.linalg.activations.Activation;
 import org.nd4j.linalg.activations.IActivation;
 import org.nd4j.linalg.activations.impl.ActivationSigmoid;
-import org.nd4j.linalg.api.ndarray.INDArray;
-
-import java.util.Collection;
-import java.util.Map;
 
 /**
  * LSTM recurrent net, based on Graves: Supervised Sequence Labelling with Recurrent Neural Networks
@@ -79,24 +69,6 @@ public abstract class AbstractLSTM extends BaseRecurrentLayer {
         }
     }
 
-    @Override
-    public double getLearningRateByParam(String paramName) {
-        switch (paramName) {
-            case LSTMParamInitializer.INPUT_WEIGHT_KEY:
-            case LSTMParamInitializer.RECURRENT_WEIGHT_KEY:
-                return learningRate;
-            case LSTMParamInitializer.BIAS_KEY:
-                if (!Double.isNaN(biasLearningRate)) {
-                    //Bias learning rate has been explicitly set
-                    return biasLearningRate;
-                } else {
-                    return learningRate;
-                }
-            default:
-                throw new IllegalArgumentException("Unknown parameter name: \"" + paramName + "\"");
-        }
-    }
-
     @AllArgsConstructor
     @NoArgsConstructor
     public static abstract class Builder<T extends Builder<T>> extends BaseRecurrentLayer.Builder<T> {
@@ -109,7 +81,7 @@ public abstract class AbstractLSTM extends BaseRecurrentLayer {
          */
         public T forgetGateBiasInit(double biasInit) {
             this.forgetGateBiasInit = biasInit;
-            return (T)this;
+            return (T) this;
         }
 
         /**
@@ -119,7 +91,7 @@ public abstract class AbstractLSTM extends BaseRecurrentLayer {
          * @param gateActivationFn Activation function for the LSTM gates
          */
         public T gateActivationFunction(String gateActivationFn) {
-            return (T)gateActivationFunction(Activation.fromString(gateActivationFn));
+            return (T) gateActivationFunction(Activation.fromString(gateActivationFn));
         }
 
         /**
@@ -129,7 +101,7 @@ public abstract class AbstractLSTM extends BaseRecurrentLayer {
          * @param gateActivationFn Activation function for the LSTM gates
          */
         public T gateActivationFunction(Activation gateActivationFn) {
-            return (T)gateActivationFunction(gateActivationFn.getActivationFunction());
+            return (T) gateActivationFunction(gateActivationFn.getActivationFunction());
         }
 
         /**
@@ -140,7 +112,7 @@ public abstract class AbstractLSTM extends BaseRecurrentLayer {
          */
         public T gateActivationFunction(IActivation gateActivationFn) {
             this.gateActivationFn = gateActivationFn;
-            return (T)this;
+            return (T) this;
         }
 
     }

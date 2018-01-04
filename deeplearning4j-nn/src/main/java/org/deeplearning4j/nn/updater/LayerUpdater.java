@@ -1,8 +1,6 @@
 package org.deeplearning4j.nn.updater;
 
-import com.google.common.base.Preconditions;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.math3.util.FastMath;
 import org.deeplearning4j.nn.api.Layer;
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.nd4j.linalg.api.ndarray.INDArray;
@@ -39,6 +37,11 @@ public class LayerUpdater extends BaseMultiLayerUpdater<Layer> {
     @Override
     protected INDArray getFlattenedGradientsView() {
         return network.getGradientsViewArray();
+    }
+
+    @Override
+    protected INDArray getParams() {
+        return network.params();
     }
 
     @Override

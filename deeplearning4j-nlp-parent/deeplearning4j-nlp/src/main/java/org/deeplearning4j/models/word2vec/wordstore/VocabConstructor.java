@@ -2,7 +2,6 @@ package org.deeplearning4j.models.word2vec.wordstore;
 
 import lombok.Data;
 import lombok.NonNull;
-import org.deeplearning4j.bagofwords.vectorizer.TfidfVectorizer;
 import org.deeplearning4j.models.embeddings.WeightLookupTable;
 import org.deeplearning4j.models.embeddings.wordvectors.WordVectors;
 import org.deeplearning4j.models.sequencevectors.interfaces.SequenceIterator;
@@ -220,7 +219,7 @@ public class VocabConstructor<T extends SequenceElement> {
                 // if we're not in parallel mode - wait till this runnable finishes
                 if (!allowParallelBuilder) {
                     while (execCounter.get() != finCounter.get())
-                        LockSupport.parkNanos(1000);
+                        LockSupport.parkNanos(100);
                 }
 
                 // as we see in profiler, this lock isn't really happen too often
@@ -228,7 +227,7 @@ public class VocabConstructor<T extends SequenceElement> {
 
                 while (execCounter.get() - finCounter.get() > numProc) {
                     try {
-                        Thread.sleep(1);
+                        LockSupport.parkNanos(100);
                     } catch (Exception e) {
                     }
                 }
@@ -267,7 +266,7 @@ public class VocabConstructor<T extends SequenceElement> {
                     log.info("Starting scavenger...");
                     while (execCounter.get() != finCounter.get()) {
                         try {
-                            Thread.sleep(2);
+                            LockSupport.parkNanos(100);
                         } catch (Exception e) {
                         }
                     }
@@ -283,10 +282,10 @@ public class VocabConstructor<T extends SequenceElement> {
             }
 
             // block untill all threads are finished
-            log.debug("Wating till all processes stop...");
+            log.debug("Waiting till all processes stop...");
             while (execCounter.get() != finCounter.get()) {
                 try {
-                    Thread.sleep(2);
+                    LockSupport.parkNanos(100);
                 } catch (Exception e) {
                 }
             }
@@ -314,12 +313,6 @@ public class VocabConstructor<T extends SequenceElement> {
 
 
         System.gc();
-        System.gc();
-        try {
-            Thread.sleep(1000);
-        } catch (Exception e) {
-            //
-        }
 
         cache.importVocabulary(topHolder);
 
@@ -359,12 +352,7 @@ public class VocabConstructor<T extends SequenceElement> {
         executorService.shutdown();
 
         System.gc();
-        System.gc();
-        try {
-            Thread.sleep(1000);
-        } catch (Exception e) {
-            //
-        }
+
         long endSequences = seqCount.get();
         long endTime = System.currentTimeMillis();
         double seconds = (endTime - startTime) / (double) 1000;
@@ -594,8 +582,7 @@ public class VocabConstructor<T extends SequenceElement> {
 
                         if (index != null) {
                             if (document.getSequenceLabel() != null) {
-                                index.addWordsToDoc(index.numDocuments(), document.getElements(),
-                                        document.getSequenceLabel());
+                                index.addWordsToDoc(index.numDocuments(), document.getElements(), document.getSequenceLabel());
                             } else {
                                 index.addWordsToDoc(index.numDocuments(), document.getElements());
                             }

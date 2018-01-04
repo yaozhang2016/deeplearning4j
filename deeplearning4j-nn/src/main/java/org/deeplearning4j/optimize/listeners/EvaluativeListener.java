@@ -4,13 +4,13 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
-import org.deeplearning4j.eval.*;
+import org.deeplearning4j.eval.Evaluation;
+import org.deeplearning4j.eval.IEvaluation;
 import org.deeplearning4j.exception.DL4JInvalidInputException;
 import org.deeplearning4j.nn.api.Model;
 import org.deeplearning4j.nn.graph.ComputationGraph;
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.deeplearning4j.optimize.api.InvocationType;
-import org.deeplearning4j.optimize.api.IterationListener;
 import org.deeplearning4j.optimize.api.TrainingListener;
 import org.deeplearning4j.optimize.listeners.callbacks.EvaluationCallback;
 import org.nd4j.linalg.api.ndarray.INDArray;
@@ -91,7 +91,8 @@ public class EvaluativeListener implements TrainingListener {
         this(iterator, frequency, InvocationType.ITERATION_END, evaluations);
     }
 
-    public EvaluativeListener(@NonNull DataSetIterator iterator, int frequency, @NonNull InvocationType type, IEvaluation... evaluations) {
+    public EvaluativeListener(@NonNull DataSetIterator iterator, int frequency, @NonNull InvocationType type,
+                    IEvaluation... evaluations) {
         this.dsIterator = iterator;
         this.frequency = frequency;
         this.evaluations = evaluations;
@@ -108,7 +109,8 @@ public class EvaluativeListener implements TrainingListener {
         this(iterator, frequency, InvocationType.ITERATION_END, evaluations);
     }
 
-    public EvaluativeListener(@NonNull MultiDataSetIterator iterator, int frequency, @NonNull InvocationType type, IEvaluation... evaluations) {
+    public EvaluativeListener(@NonNull MultiDataSetIterator iterator, int frequency, @NonNull InvocationType type,
+                    IEvaluation... evaluations) {
         this.mdsIterator = iterator;
         this.frequency = frequency;
         this.evaluations = evaluations;
@@ -121,10 +123,11 @@ public class EvaluativeListener implements TrainingListener {
     }
 
     public EvaluativeListener(@NonNull MultiDataSet multiDataSet, int frequency, @NonNull InvocationType type) {
-        this(multiDataSet, frequency, type,  new Evaluation());
+        this(multiDataSet, frequency, type, new Evaluation());
     }
 
-    public EvaluativeListener(@NonNull DataSet dataSet, int frequency, @NonNull InvocationType type,  IEvaluation... evaluations) {
+    public EvaluativeListener(@NonNull DataSet dataSet, int frequency, @NonNull InvocationType type,
+                    IEvaluation... evaluations) {
         this.ds = dataSet;
         this.frequency = frequency;
         this.evaluations = evaluations;
@@ -132,28 +135,13 @@ public class EvaluativeListener implements TrainingListener {
         this.invocationType = type;
     }
 
-    public EvaluativeListener(@NonNull MultiDataSet multiDataSet, int frequency, @NonNull InvocationType type, IEvaluation... evaluations) {
+    public EvaluativeListener(@NonNull MultiDataSet multiDataSet, int frequency, @NonNull InvocationType type,
+                    IEvaluation... evaluations) {
         this.mds = multiDataSet;
         this.frequency = frequency;
         this.evaluations = evaluations;
 
         this.invocationType = type;
-    }
-
-    /**
-     * Get if listener invoked
-     */
-    @Override
-    public boolean invoked() {
-        return false;
-    }
-
-    /**
-     * Change invoke to true
-     */
-    @Override
-    public void invoke() {
-
     }
 
     /**
@@ -163,7 +151,7 @@ public class EvaluativeListener implements TrainingListener {
      * @param iteration the iteration
      */
     @Override
-    public void iterationDone(Model model, int iteration) {
+    public void iterationDone(Model model, int iteration, int epoch) {
         // no-op
     }
 
@@ -232,16 +220,18 @@ public class EvaluativeListener implements TrainingListener {
                 ((ComputationGraph) model).doEvaluation(mdsIterator, evaluations);
             } else if (ds != null) {
                 for (IEvaluation evaluation : evaluations)
-                    evalAtIndex(evaluation, new INDArray[]{ds.getLabels()},((ComputationGraph) model).output(ds.getFeatureMatrix()), 0);
+                    evalAtIndex(evaluation, new INDArray[] {ds.getLabels()},
+                                    ((ComputationGraph) model).output(ds.getFeatureMatrix()), 0);
             } else if (mds != null) {
                 for (IEvaluation evaluation : evaluations)
                     evalAtIndex(evaluation, mds.getLabels(), ((ComputationGraph) model).output(mds.getFeatures()), 0);
             }
-        } else throw new DL4JInvalidInputException("Model is unknown: " + model.getClass().getCanonicalName());
+        } else
+            throw new DL4JInvalidInputException("Model is unknown: " + model.getClass().getCanonicalName());
 
         // TODO: maybe something better should be used here?
         log.info("Reporting evaluation results:");
-        for (IEvaluation evaluation: evaluations)
+        for (IEvaluation evaluation : evaluations)
             log.info("{}:\n{}", evaluation.getClass().getSimpleName(), evaluation.stats());
 
 

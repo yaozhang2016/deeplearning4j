@@ -21,21 +21,28 @@ package org.deeplearning4j.nn.multilayer;
 
 import lombok.Getter;
 import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
-import org.deeplearning4j.berkeley.Pair;
-import org.deeplearning4j.berkeley.Triple;
 import org.deeplearning4j.datasets.iterator.AsyncDataSetIterator;
+import org.deeplearning4j.datasets.iterator.MultiDataSetWrapperIterator;
 import org.deeplearning4j.eval.*;
+import org.deeplearning4j.exception.DL4JException;
+import org.deeplearning4j.exception.DL4JInvalidInputException;
 import org.deeplearning4j.nn.api.*;
 import org.deeplearning4j.nn.api.Updater;
 import org.deeplearning4j.nn.api.layers.IOutputLayer;
 import org.deeplearning4j.nn.api.layers.RecurrentLayer;
 import org.deeplearning4j.nn.conf.*;
+import org.deeplearning4j.nn.conf.inputs.InputType;
+import org.deeplearning4j.nn.conf.layers.BaseLayer;
 import org.deeplearning4j.nn.conf.layers.FeedForwardLayer;
 import org.deeplearning4j.nn.gradient.DefaultGradient;
 import org.deeplearning4j.nn.gradient.Gradient;
+import org.deeplearning4j.nn.graph.ComputationGraph;
 import org.deeplearning4j.nn.layers.FrozenLayer;
+import org.deeplearning4j.nn.layers.recurrent.RnnLossLayer;
+import org.deeplearning4j.nn.layers.recurrent.RnnOutputLayer;
 import org.deeplearning4j.nn.updater.MultiLayerUpdater;
 import org.deeplearning4j.nn.updater.UpdaterCreator;
 import org.deeplearning4j.nn.weights.WeightInit;
@@ -43,16 +50,18 @@ import org.deeplearning4j.optimize.Solver;
 import org.deeplearning4j.optimize.api.ConvexOptimizer;
 import org.deeplearning4j.optimize.api.IterationListener;
 import org.deeplearning4j.optimize.api.TrainingListener;
+import org.deeplearning4j.optimize.solvers.accumulation.GradientsAccumulator;
 import org.deeplearning4j.util.ModelSerializer;
+import org.deeplearning4j.util.NetworkUtils;
+import org.deeplearning4j.util.OneTimeLogger;
 import org.nd4j.linalg.api.memory.MemoryWorkspace;
 import org.nd4j.linalg.api.memory.conf.WorkspaceConfiguration;
-import org.nd4j.linalg.api.memory.enums.AllocationPolicy;
-import org.nd4j.linalg.api.memory.enums.LearningPolicy;
-import org.nd4j.linalg.api.memory.enums.ResetPolicy;
-import org.nd4j.linalg.api.memory.enums.SpillPolicy;
+import org.nd4j.linalg.api.memory.enums.*;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.dataset.DataSet;
+import org.nd4j.linalg.dataset.api.MultiDataSet;
 import org.nd4j.linalg.dataset.api.iterator.DataSetIterator;
+import org.nd4j.linalg.dataset.api.iterator.MultiDataSetIterator;
 import org.nd4j.linalg.factory.Nd4j;
 import org.nd4j.linalg.heartbeat.Heartbeat;
 import org.nd4j.linalg.heartbeat.reports.Environment;
@@ -62,12 +71,17 @@ import org.nd4j.linalg.heartbeat.utils.EnvironmentUtils;
 import org.nd4j.linalg.heartbeat.utils.TaskUtils;
 import org.nd4j.linalg.indexing.NDArrayIndex;
 import org.nd4j.linalg.memory.abstracts.DummyWorkspace;
+import org.nd4j.linalg.primitives.Pair;
+import org.nd4j.linalg.primitives.Triple;
+import org.nd4j.linalg.schedule.ISchedule;
 import org.nd4j.linalg.util.FeatureUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+import java.io.File;
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
+
+import static org.deeplearning4j.nn.graph.ComputationGraph.workspaceConfigurationCache;
 
 
 /**
@@ -78,8 +92,8 @@ import java.util.*;
  *
  * @author Adam Gibson
  */
-public class MultiLayerNetwork implements Serializable, Classifier, Layer {
-    private static final Logger log = LoggerFactory.getLogger(MultiLayerNetwork.class);
+@Slf4j
+public class MultiLayerNetwork implements Serializable, Classifier, Layer, NeuralNetwork {
 
     //the hidden neural network layers (including output layer)
     protected Layer[] layers;
@@ -89,8 +103,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     protected INDArray input, labels;
 
     protected boolean initCalled = false;
-    private Collection<IterationListener> listeners = new ArrayList<>();
-    private Collection<TrainingListener> trainingListeners = new ArrayList<>();
+    protected Collection<IterationListener> listeners = new ArrayList<>();
+    protected Collection<TrainingListener> trainingListeners = new ArrayList<>();
 
     protected NeuralNetConfiguration defaultConfiguration;
     protected MultiLayerConfiguration layerWiseConfigurations;
@@ -103,7 +117,7 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     @Getter
     protected transient INDArray flattenedGradients; //Gradients for all layers are a view/subset of this array
 
-    protected ThreadLocal<Long> lastEtlTime = new ThreadLocal<>();
+    protected transient ThreadLocal<Long> lastEtlTime = new ThreadLocal<>();
 
     /*
       Binary drop connect mask
@@ -120,35 +134,37 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     public final static String workspaceTBPTT = "LOOP_TBPTT";
 
     protected final static WorkspaceConfiguration workspaceConfigurationExternal = WorkspaceConfiguration.builder()
-            .initialSize(0)
-            .overallocationLimit(0.3)
-            .policyLearning(LearningPolicy.FIRST_LOOP)
-            .policyReset(ResetPolicy.BLOCK_LEFT)
-            .policySpill(SpillPolicy.REALLOCATE)
-            .policyAllocation(AllocationPolicy.OVERALLOCATE)
-            .build();
+                    .initialSize(0).overallocationLimit(0.3).policyLearning(LearningPolicy.FIRST_LOOP)
+                    .policyReset(ResetPolicy.BLOCK_LEFT).policySpill(SpillPolicy.REALLOCATE)
+                    .policyAllocation(AllocationPolicy.OVERALLOCATE).build();
 
-    protected WorkspaceConfiguration workspaceConfigurationFeedForward = WorkspaceConfiguration.builder()
-            .initialSize(0)
-            .overallocationLimit(0.2)
-            .policyReset(ResetPolicy.BLOCK_LEFT)
-            .policyLearning(LearningPolicy.OVER_TIME)
-            .policySpill(SpillPolicy.REALLOCATE)
-            .policyAllocation(AllocationPolicy.OVERALLOCATE)
-            .build();
+    protected WorkspaceConfiguration workspaceConfigurationFeedForward = WorkspaceConfiguration.builder().initialSize(0)
+                    .overallocationLimit(0.2).policyReset(ResetPolicy.BLOCK_LEFT)
+                    .policyLearning(LearningPolicy.OVER_TIME).policySpill(SpillPolicy.REALLOCATE)
+                    .policyAllocation(AllocationPolicy.OVERALLOCATE).build();
 
     protected final static WorkspaceConfiguration workspaceConfigurationTBPTT = WorkspaceConfiguration.builder()
-            .initialSize(0)
-            .overallocationLimit(0.2)
-            .policyReset(ResetPolicy.BLOCK_LEFT)
-            .policyAllocation(AllocationPolicy.OVERALLOCATE)
-            .policySpill(SpillPolicy.REALLOCATE)
-            .policyLearning(LearningPolicy.OVER_TIME)
-            .build();
+                    .initialSize(0).overallocationLimit(0.2).policyReset(ResetPolicy.BLOCK_LEFT)
+                    .policyAllocation(AllocationPolicy.OVERALLOCATE).policySpill(SpillPolicy.REALLOCATE)
+                    .policyLearning(LearningPolicy.OVER_TIME).build();
 
     public MultiLayerNetwork(MultiLayerConfiguration conf) {
         this.layerWiseConfigurations = conf;
         this.defaultConfiguration = conf.getConf(0).clone();
+    }
+
+    /**
+     * This method sets specified CacheMode for all layers within network
+     *
+     * @param mode
+     */
+    public void setCacheMode(CacheMode mode) {
+        if (mode == null)
+            mode = CacheMode.NONE;
+
+        for (Layer layer : layers) {
+            layer.setCacheMode(mode);
+        }
     }
 
     public void setLastEtlTime(long time) {
@@ -200,7 +216,7 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
 
     /**
-     * Perform layerwise pretraining on all pre-trainable layers in the network (VAEs, RBMs, Autoencoders, etc)<br>
+     * Perform layerwise pretraining on all pre-trainable layers in the network (VAEs, Autoencoders, etc)<br>
      * Note that pretraining will be performed on one layer after the other, resetting the DataSetIterator between iterations.<br>
      * For multiple epochs per layer, appropriately wrap the iterator (for example, a MultipleEpochsIterator) or train
      * each layer manually using {@link #pretrainLayer(int, DataSetIterator)}
@@ -208,10 +224,15 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      * @param iter Training data
      */
     public void pretrain(DataSetIterator iter) {
-        if (flattenedGradients == null)
+        if (flattenedGradients == null) {
             initGradientsView();
+        }
         if (!layerWiseConfigurations.isPretrain())
             return;
+
+        for (TrainingListener tl : trainingListeners) {
+            tl.onEpochStart(this);
+        }
 
         for (int i = 0; i < getnLayers(); i++) {
             pretrainLayer(i, iter);
@@ -219,15 +240,16 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     }
 
     /**
-     * Perform layerwise unsupervised training on a single pre-trainable layer in the network (VAEs, RBMs, Autoencoders, etc)<br>
+     * Perform layerwise unsupervised training on a single pre-trainable layer in the network (VAEs, Autoencoders, etc)<br>
      * If the specified layer index (0 to numLayers - 1) is not a pretrainable layer, this is a no-op.
      *
      * @param layerIdx Index of the layer to train (0 to numLayers-1)
      * @param iter Training data
      */
     public void pretrainLayer(int layerIdx, DataSetIterator iter) {
-        if (flattenedGradients == null)
+        if (flattenedGradients == null) {
             initGradientsView();
+        }
         if (!layerWiseConfigurations.isPretrain())
             return;
         if (layerIdx >= layers.length) {
@@ -243,24 +265,44 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             iter.reset();
         }
 
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        ComputationGraph.workspaceConfigurationExternal,
+                                                        ComputationGraph.workspaceExternal);
+        MemoryWorkspace cache =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        ComputationGraph.workspaceConfigurationCache,
+                                                        ComputationGraph.workspaceCache);
+
         log.info("Starting unsupervised training on layer " + layerIdx);
         while (iter.hasNext()) {
             DataSet next = iter.next();
-            input = next.getFeatureMatrix();
-            pretrainLayer(layerIdx, input);
+
+            try (MemoryWorkspace wsCache = cache.notifyScopeEntered()) {
+                try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
+                    input = next.getFeatureMatrix();
+                    pretrainLayer(layerIdx, input);
+                }
+            }
         }
+
+        int ec = getLayer(layerIdx).conf().getEpochCount() + 1;
+        getLayer(layerIdx).conf().setEpochCount(ec);
     }
 
     /**
-     * Perform layerwise unsupervised training on a single pre-trainable layer in the network (VAEs, RBMs, Autoencoders, etc)<br>
+     * Perform layerwise unsupervised training on a single pre-trainable layer in the network (VAEs, Autoencoders, etc)<br>
      * If the specified layer index (0 to numLayers - 1) is not a pretrainable layer, this is a no-op.
      *
      * @param layerIdx Index of the layer to train (0 to numLayers-1)
      * @param features Training data array
      */
     public void pretrainLayer(int layerIdx, INDArray features) {
-        if (flattenedGradients == null)
+        if (flattenedGradients == null) {
             initGradientsView();
+        }
         if (!layerWiseConfigurations.isPretrain())
             return;
         if (layerIdx >= layers.length) {
@@ -278,11 +320,34 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             return;
         layer.conf().setPretrain(true);
 
-        //Do forward pass to the layer to be pretrained
-        for (int j = 0; j < layerIdx; j++) {
-            layerInput = activationFromPrevLayer(j, layerInput, true);
+        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE
+                        ? new DummyWorkspace()
+                        : layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE
+                                        ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationFeedForward, workspaceFeedForward);
+
+        MemoryWorkspace pretrain = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE
+                        ? new DummyWorkspace()
+                        : layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE
+                                        ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationFeedForward,
+                                                        ComputationGraph.workspacePretrain);
+
+        try (MemoryWorkspace wsP = pretrain.notifyScopeEntered()) {
+            //Do forward pass to the layer to be pretrained
+            for (int j = 0; j < layerIdx; j++) {
+                try (MemoryWorkspace wsFF = workspace.notifyScopeEntered()) {
+                    if (Nd4j.getWorkspaceManager().checkIfWorkspaceExistsAndActive(ComputationGraph.workspacePretrain))
+                        layerInput = activationFromPrevLayer(j, layerInput, true)
+                                        .leverageTo(ComputationGraph.workspacePretrain);
+                    else
+                        layerInput = activationFromPrevLayer(j, layerInput, true);
+                }
+            }
+            layer.fit(layerInput);
         }
-        layer.fit(layerInput);
 
         // Turn off pretrain after it is complete
         layer.conf().setPretrain(false);
@@ -297,8 +362,24 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     public void pretrain(INDArray input) {
         if (!layerWiseConfigurations.isPretrain())
             return;
-        if (flattenedGradients == null)
+        if (flattenedGradients == null) {
             initGradientsView();
+        }
+
+        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE
+                        ? new DummyWorkspace()
+                        : layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE
+                                        ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationFeedForward, workspaceFeedForward);
+
+        MemoryWorkspace pretrain = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE
+                        ? new DummyWorkspace()
+                        : layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE
+                                        ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationFeedForward,
+                                                        ComputationGraph.workspacePretrain);
 
         /* During pretrain, feed forward expected activations of network, use activation cooccurrences during pretrain  */
 
@@ -308,20 +389,28 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         int nPretrainLayers = getnLayers();
         if (getLayer(getnLayers() - 1) instanceof IOutputLayer)
             nPretrainLayers--;
-        for (int i = 0; i < nPretrainLayers; i++) {
-            layer = getLayer(i);
-            if (i == 0) {
-                if (getLayerWiseConfigurations().getInputPreProcess(i) != null) {
-                    layerInput = getLayerWiseConfigurations().getInputPreProcess(i).preProcess(input, miniBatchSize);
-                } else {
-                    layerInput = input;
+
+        try (MemoryWorkspace wsP = pretrain.notifyScopeEntered()) {
+            for (int i = 0; i < nPretrainLayers; i++) {
+                try (MemoryWorkspace wsFF = workspace.notifyScopeEntered()) {
+                    layer = getLayer(i);
+                    if (i == 0) {
+                        if (getLayerWiseConfigurations().getInputPreProcess(i) != null) {
+                            layerInput = getLayerWiseConfigurations().getInputPreProcess(i)
+                                            .preProcess(input, miniBatchSize)
+                                            .leverageTo(ComputationGraph.workspacePretrain);
+                        } else {
+                            layerInput = input.leverageTo(ComputationGraph.workspacePretrain);
+                        }
+                    } else {
+                        layerInput = activationFromPrevLayer(i - 1, layerInput, true)
+                                        .leverageTo(ComputationGraph.workspacePretrain);
+                    }
+                    layer.conf().setPretrain(true);
+                    layer.fit(layerInput);
+                    layer.conf().setPretrain(false);
                 }
-            } else {
-                layerInput = activationFromPrevLayer(i - 1, layerInput, true);
             }
-            layer.conf().setPretrain(true);
-            layer.fit(layerInput);
-            layer.conf().setPretrain(false);
         }
     }
 
@@ -352,7 +441,7 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
     @Override
     public ConvexOptimizer getOptimizer() {
-        throw new UnsupportedOperationException();
+        return solver.getOptimizer();
     }
 
     @Override
@@ -393,8 +482,28 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
     @Override
     public void setParamTable(Map<String, INDArray> paramTable) {
-        throw new UnsupportedOperationException();
+        Map<String, INDArray> currParamTable = paramTable();
+        if (!currParamTable.keySet().equals(paramTable.keySet())) {
+            throw new IllegalArgumentException("Cannot set param table: parameter keys do not match.\n" + "Current: "
+                            + currParamTable.keySet() + "\nTo set: " + paramTable.keySet());
+        }
 
+        for (String s : paramTable.keySet()) {
+            INDArray curr = currParamTable.get(s);
+            INDArray toSet = paramTable.get(s);
+            if (!Arrays.equals(curr.shape(), toSet.shape())) {
+                throw new IllegalArgumentException("Cannot set parameter table: parameter \"" + s + "\" shapes "
+                                + "do not match. Current = " + Arrays.toString(curr.shape()) + ", to set = "
+                                + Arrays.toString(toSet.shape()));
+            }
+        }
+
+        //Now that we've checked ALL params (to avoid leaving net in half-modified state)
+        for (String s : paramTable.keySet()) {
+            INDArray curr = currParamTable.get(s);
+            INDArray toSet = paramTable.get(s);
+            curr.assign(toSet);
+        }
     }
 
     @Override
@@ -457,6 +566,14 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         if (initCalled)
             return;
 
+        OneTimeLogger.info(log, "Starting MultiLayerNetwork with WorkspaceModes set to [training: {}; inference: {}]",
+                        layerWiseConfigurations.getTrainingWorkspaceMode(),
+                        layerWiseConfigurations.getInferenceWorkspaceMode());
+
+        if (layerWiseConfigurations.getCacheMode() == CacheMode.HOST) {
+            workspaceConfigurationCache.setPolicyMirroring(MirroringPolicy.HOST_ONLY);
+        }
+
         int nLayers = getnLayers();
 
         if (nLayers < 1)
@@ -495,6 +612,11 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
                 initializeParams = true;
             }
 
+            //Set RNG seed, for repeatability between initializations when set
+            if (initializeParams) {
+                Nd4j.getRandom().setSeed(getDefaultConfiguration().getSeed());
+            }
+
             // construct multi-layer
             int paramCountSoFar = 0;
             for (int i = 0; i < nLayers; i++) {
@@ -523,6 +645,31 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
                 variables.add(i + "_" + s);
             }
         }
+
+        // now we init solver & optimizer
+        if (solver == null) {
+            try (MemoryWorkspace wsO = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
+                solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this).build();
+                solver.initOptimizer();
+            }
+        }
+
+        synchronizeIterEpochCounts();
+    }
+
+    /**
+     * This method allows you to specificy GradientsAccumulator instance to be used with this model
+     *
+     * PLEASE NOTE: Do not use this method unless you understand how to use GradientsAccumulator & updates sharing.
+     * PLEASE NOTE: Do not use this method on standalone model
+     *
+     * @param accumulator
+     */
+    public void setGradientsAccumulator(GradientsAccumulator accumulator) {
+        if (!isInitCalled())
+            init();
+
+        solver.getOptimizer().setGradientsAccumulator(accumulator);
     }
 
     public boolean isInitCalled() {
@@ -534,30 +681,32 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      * As a general rule, this shouldn't ever need to be called manually when doing training via fit(DataSet) or fit(DataSetIterator)
      */
     public void initGradientsView() {
-        if (layers == null)
-            init();
+        try (MemoryWorkspace ws = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
+            if (layers == null)
+                init();
 
-        int nLayers = layers.length;
+            int nLayers = layers.length;
 
-        //First: Work out total length of (backprop) params
-        int backpropParamLength = 0;
-        int[] nParamsPerLayer = new int[nLayers];
-        for (int i = 0; i < nLayers; i++) {
-            NeuralNetConfiguration conf = layerWiseConfigurations.getConf(i);
-            nParamsPerLayer[i] = layers[i].conf().getLayer().initializer().numParams(conf);
-            backpropParamLength += nParamsPerLayer[i];
-        }
+            //First: Work out total length of params
+            int paramLength = 0;
+            int[] nParamsPerLayer = new int[nLayers];
+            for (int i = 0; i < nLayers; i++) {
+                NeuralNetConfiguration conf = layerWiseConfigurations.getConf(i);
+                nParamsPerLayer[i] = conf.getLayer().initializer().numParams(conf);
+                paramLength += nParamsPerLayer[i];
+            }
 
-        flattenedGradients = Nd4j.zeros(new int[] {1, backpropParamLength}, 'f'); //No need to initialize, as each layer will do it each iteration anyway
+            flattenedGradients = Nd4j.zeros(new int[] {1, paramLength}, 'f'); //No need to initialize, as each layer will do it each iteration anyway
 
-        int backpropParamsSoFar = 0;
-        for (int i = 0; i < layers.length; i++) {
-            if (nParamsPerLayer[i] == 0)
-                continue; //This layer doesn't have any parameters...
-            INDArray thisLayerGradView = flattenedGradients.get(NDArrayIndex.point(0),
-                            NDArrayIndex.interval(backpropParamsSoFar, backpropParamsSoFar + nParamsPerLayer[i]));
-            layers[i].setBackpropGradientsViewArray(thisLayerGradView);
-            backpropParamsSoFar += nParamsPerLayer[i];
+            int backpropParamsSoFar = 0;
+            for (int i = 0; i < layers.length; i++) {
+                if (nParamsPerLayer[i] == 0)
+                    continue; //This layer doesn't have any parameters...
+                INDArray thisLayerGradView = flattenedGradients.get(NDArrayIndex.point(0),
+                                NDArrayIndex.interval(backpropParamsSoFar, backpropParamsSoFar + nParamsPerLayer[i]));
+                layers[i].setBackpropGradientsViewArray(thisLayerGradView);
+                backpropParamsSoFar += nParamsPerLayer[i];
+            }
         }
     }
 
@@ -595,18 +744,6 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      */
     public INDArray activate(int layer, INDArray input) {
         return getLayer(layer).activate(input);
-    }
-
-    @Override
-    public INDArray activationMean() {
-        //TODO determine how to pass back all activationMean for MLN
-        throw new UnsupportedOperationException();
-        //        List<INDArray> avgActivations =  new ArrayList<>();
-        //
-        //        for( Layer layer: getLayers() ){
-        //            avgActivations.add(layer.activationMean());
-        //            }
-        //        return Nd4j.toFlattened(avgActivations);
     }
 
     /**
@@ -650,8 +787,21 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      * @return the activation from the previous layer
      */
     public INDArray activationFromPrevLayer(int curr, INDArray input, boolean training) {
-        if (getLayerWiseConfigurations().getInputPreProcess(curr) != null)
-            input = getLayerWiseConfigurations().getInputPreProcess(curr).preProcess(input, getInputMiniBatchSize());
+        if (getLayerWiseConfigurations().getInputPreProcess(curr) != null) {
+            if (Nd4j.getWorkspaceManager().checkIfWorkspaceExistsAndActive(workspaceExternal)
+                    && Nd4j.getMemoryManager().getCurrentWorkspace() != Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)) {
+                //WS single, or FF as part of backprop
+                //NOTE: we *could* leverage instead (less memory, worse performance), but most preprocessors will only
+                //allocate 1 array (i.e., the new output), so this is usually preferable in practice
+                try (MemoryWorkspace wsB = Nd4j.getWorkspaceManager()
+                        .getWorkspaceForCurrentThread(workspaceExternal).notifyScopeBorrowed()) {
+                    input = getLayerWiseConfigurations().getInputPreProcess(curr).preProcess(input, getInputMiniBatchSize());
+                }
+            } else {
+                input = getLayerWiseConfigurations().getInputPreProcess(curr).preProcess(input, getInputMiniBatchSize());
+            }
+        }
+
         INDArray ret = layers[curr].activate(input, training);
         return ret;
     }
@@ -736,6 +886,21 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         return feedForwardToLayer(layers.length - 1, train);
     }
 
+    /**
+     * Perform feed-forward, optionally (not) clearing the layer input arrays.<br>
+     * Note: this method should NOT be used with clearInputs = true, unless you know what you are doing. Specifically:
+     * when using clearInputs=false, in combination with workspaces, the layer input fields may leak outside of the
+     * workspaces in which they were defined - potentially causing a crash. See https://deeplearning4j.org/workspaces
+     * for more details
+     *
+     * @param train       training mode
+     * @param clearInputs If false: don't clear the layer inputs
+     * @return Activations from feed-forward
+     */
+    public List<INDArray> feedForward(boolean train, boolean clearInputs){
+        return feedForwardToLayer(layers.length-1, train, clearInputs);
+    }
+
     /** Compute the activations from the input to the specified layer.<br>
      * To compute activations for all layers, use feedForward(...) methods<br>
      * Note: output list includes the original input. So list.get(0) is always the original input, and
@@ -774,21 +939,35 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      * @return list of activations.
      */
     public List<INDArray> feedForwardToLayer(int layerNum, boolean train) {
-        INDArray currInput = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? input : input.migrate();
+        return feedForwardToLayer(layerNum, train, true);
+    }
+
+    protected List<INDArray> feedForwardToLayer(int layerNum, boolean train, boolean publicApi) {
+        // TODO: maybe remove that?
+        INDArray currInput =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE || !input.isAttached()
+                                        ? input : input.migrate();
         List<INDArray> activations = new ArrayList<>();
         activations.add(currInput);
 
 
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() :
-                layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
-                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationFeedForward, workspaceFeedForward);
+        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE
+                        ? new DummyWorkspace()
+                        : layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE
+                                        ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationFeedForward, workspaceFeedForward);
 
         for (int i = 0; i <= layerNum; i++) {
             // log.info("Activating layer: {}", i);
             try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
-                currInput = activationFromPrevLayer(i, currInput, train).leverageTo(workspaceExternal);
-                //currInput = activationFromPrevLayer(i, currInput, train);
-                //applies drop connect to the activation
+                currInput = activationFromPrevLayer(i, currInput, train);
+
+                if(publicApi){
+                    currInput = currInput.detach();
+                } else {
+                    currInput = currInput.leverageTo(workspaceExternal);
+                }
                 activations.add(currInput);
             }
         }
@@ -796,6 +975,10 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         if (!train)
             if (layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SEPARATE)
                 Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceFeedForward).initializeWorkspace();
+
+        if(publicApi) {
+            clearLayersStates();    //Ensure INDArrays in layer input fields don't leak out of workspace (via .input() etc)
+        }
 
         return activations;
     }
@@ -851,6 +1034,10 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     }
 
 
+    /**
+     * Clones the multilayernetwork
+     * @return
+     */
     @Override
     public MultiLayerNetwork clone() {
         MultiLayerConfiguration conf = this.layerWiseConfigurations.clone();
@@ -871,15 +1058,15 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             Layer[] clonedLayers = ret.getLayers();
             for (int i = 0; i < layers.length; i++) {
                 if (layers[i] instanceof FrozenLayer) {
-                    clonedLayers[i] = new FrozenLayer<>(ret.getLayer(i));
+                    clonedLayers[i] = new FrozenLayer(ret.getLayer(i));
                 }
             }
             ret.setLayers(clonedLayers);
         }
         return ret;
     }
-
-    private boolean hasAFrozenLayer() {
+    
+    protected boolean hasAFrozenLayer() {
         for (int i = 0; i < layers.length - 1; i++) {
             if (layers[i] instanceof FrozenLayer)
                 return true;
@@ -1016,12 +1203,18 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     }
 
     @Override
+    /**
+     * Method doesn't do layerwise  pretraining.<br>
+     * For pretraining use method pretrain.. {@link #pretrain(DataSetIterator)}<br>
+     * @param iterator Training data (DataSetIterator)
+     */
     public void fit(DataSetIterator iterator) {
         // we're wrapping all iterators into AsyncDataSetIterator to provide background prefetch - where appropriate
         DataSetIterator iter;
         boolean destructable = false;
         if (iterator.asyncSupported()) {
-            iter = new AsyncDataSetIterator(iterator, Math.min(Nd4j.getAffinityManager().getNumberOfDevices() * 2, 4), layerWiseConfigurations.getTrainingWorkspaceMode() != WorkspaceMode.NONE);
+            iter = new AsyncDataSetIterator(iterator, Math.min(Nd4j.getAffinityManager().getNumberOfDevices() * 2, 2),
+                            layerWiseConfigurations.getTrainingWorkspaceMode() != WorkspaceMode.NONE);
             destructable = true;
         } else {
             iter = iterator;
@@ -1031,24 +1224,15 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             tl.onEpochStart(this);
         }
 
-        if (layerWiseConfigurations.isPretrain()) {
-            // TODO: pratrain should be wrapped into workspace
-            pretrain(iter);
-            if (iter.resetSupported()) {
-                iter.reset();
-            }
-            //            while (iter.hasNext()) {
-            //                DataSet next = iter.next();
-            //                if (next.getFeatureMatrix() == null || next.getLabels() == null)
-            //                    break;
-            //                setInput(next.getFeatureMatrix());
-            //                setLabels(next.getLabels());
-            //                finetune();
-            //            }
-        }
-
-
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal,workspaceExternal);
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationExternal, workspaceExternal);
+        MemoryWorkspace cache =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        ComputationGraph.workspaceConfigurationCache,
+                                                        ComputationGraph.workspaceCache);
 
         if (layerWiseConfigurations.isBackprop()) {
             update(TaskUtils.buildTask(iter));
@@ -1073,7 +1257,7 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
                 if (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT) {
                     doTruncatedBPTT(next.getFeatureMatrix(), next.getLabels(), next.getFeaturesMaskArray(),
-                                next.getLabelsMaskArray());
+                                    next.getLabelsMaskArray());
                 } else {
                     if (hasMaskArrays)
                         setLayerMaskArrays(next.getFeaturesMaskArray(), next.getLabelsMaskArray());
@@ -1082,13 +1266,16 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
                     setLabels(next.getLabels());
 
                     if (solver == null) {
-                        try(MemoryWorkspace wsO = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
-                            solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this).build();
+                        try (MemoryWorkspace wsO = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
+                            solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this)
+                                            .build();
                         }
                     }
 
-                    try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
-                        solver.optimize();
+                    try (MemoryWorkspace wsCache = cache.notifyScopeEntered()) {
+                        try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
+                            solver.optimize();
+                        }
                     }
                 }
 
@@ -1111,6 +1298,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
         if (destructable)
             ((AsyncDataSetIterator) iter).shutdown();
+
+        incrementEpochCount();
     }
 
     /** Calculate and set gradients for MultiLayerNetwork, based on OutputLayer and labels*/
@@ -1131,9 +1320,7 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      */
     protected Pair<Gradient, INDArray> calcBackpropGradients(INDArray epsilon, boolean withOutputLayer) {
         if (flattenedGradients == null) {
-            try (MemoryWorkspace ws = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
-                initGradientsView();
-            }
+            initGradientsView();
         }
         String multiGradientKey;
         Gradient gradient = new DefaultGradient(flattenedGradients);
@@ -1186,10 +1373,15 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             layerFrom = numLayers - 1;
         }
 
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() :
-                layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE ? Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceExternal)
-                        //: Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(wsConf, workspaceBackProp);
-                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationFeedForward, workspaceFeedForward);
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.SINGLE
+                                                        ? Nd4j.getWorkspaceManager()
+                                                                        .getWorkspaceForCurrentThread(workspaceExternal)
+                                                        //: Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(wsConf, workspaceBackProp);
+                                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                                        workspaceConfigurationFeedForward,
+                                                                        workspaceFeedForward);
 
         // Calculate gradients for previous layers & drops output layer in count
         for (int j = layerFrom; j >= 0; j--) {
@@ -1256,17 +1448,23 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         int timeSeriesLength = input.size(2);
         int nSubsets = timeSeriesLength / fwdLen;
         if (timeSeriesLength % fwdLen != 0)
-            nSubsets++; //Example: 100 fwdLen with timeSeriesLength=100 -> want 2 subsets (1 of size 100, 1 of size 20)
+            nSubsets++; //Example: 100 fwdLen with timeSeriesLength=120 -> want 2 subsets (1 of size 100, 1 of size 20)
 
         rnnClearPreviousState();
 
         workspaceConfigurationExternal.setCyclesBeforeInitialization(0);
         workspaceConfigurationExternal.setPolicyLearning(LearningPolicy.OVER_TIME);
 
-        MemoryWorkspace workspaceT = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationTBPTT, workspaceTBPTT);
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal,workspaceExternal);
+        MemoryWorkspace workspaceT =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationTBPTT, workspaceTBPTT);
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationExternal, workspaceExternal);
 
-        try(MemoryWorkspace wsT = workspaceT.notifyScopeEntered()) {
+        try (MemoryWorkspace wsT = workspaceT.notifyScopeEntered()) {
             for (int i = 0; i < nSubsets; i++) {
                 try (MemoryWorkspace wsE = workspace.notifyScopeEntered()) {
                     int startTimeIdx = i * fwdLen;
@@ -1274,30 +1472,17 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
                     if (endTimeIdx > timeSeriesLength)
                         endTimeIdx = timeSeriesLength;
 
-                    INDArray inputSubset = input.get(NDArrayIndex.all(), NDArrayIndex.all(),
-                            NDArrayIndex.interval(startTimeIdx, endTimeIdx));
-                    INDArray labelSubset = labels.get(NDArrayIndex.all(), NDArrayIndex.all(),
-                            NDArrayIndex.interval(startTimeIdx, endTimeIdx));
+                    INDArray[] subsets = getSubsetsForTbptt(startTimeIdx, endTimeIdx, input, labels,
+                            featuresMaskArray, labelsMaskArray);
 
-                    setInput(inputSubset);
-                    setLabels(labelSubset);
-
-                    INDArray featuresMaskSubset = null;
-                    INDArray labelsMaskSubset = null;
-                    if (featuresMaskArray != null) {
-                        featuresMaskSubset = featuresMaskArray.get(NDArrayIndex.all(),
-                                NDArrayIndex.interval(startTimeIdx, endTimeIdx));
-                    }
-                    if (labelsMaskArray != null) {
-                        labelsMaskSubset = labelsMaskArray.get(NDArrayIndex.all(),
-                                NDArrayIndex.interval(startTimeIdx, endTimeIdx));
-                    }
-                    if (featuresMaskSubset != null || labelsMaskSubset != null)
-                        setLayerMaskArrays(featuresMaskSubset, labelsMaskSubset);
+                    setInput(subsets[0]);
+                    setLabels(subsets[1]);
+                    setLayerMaskArrays(subsets[2], subsets[3]);
 
                     if (solver == null) {
                         try (MemoryWorkspace wsO = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
-                            solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this).build();
+                            solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this)
+                                            .build();
                         }
                     }
                     solver.optimize();
@@ -1318,6 +1503,26 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             clearLayerMaskArrays();
     }
 
+    private INDArray[] getSubsetsForTbptt(int startTimeIdx, int endTimeIdx, INDArray input, INDArray labels,
+                                          INDArray fMask, INDArray lMask ){
+        INDArray[] out = new INDArray[4];
+        out[0] = input.get(NDArrayIndex.all(), NDArrayIndex.all(),
+                NDArrayIndex.interval(startTimeIdx, endTimeIdx));
+        out[1] = labels.get(NDArrayIndex.all(), NDArrayIndex.all(),
+                NDArrayIndex.interval(startTimeIdx, endTimeIdx));
+
+        if (fMask != null) {
+            out[2] = fMask.get(NDArrayIndex.all(),
+                    NDArrayIndex.interval(startTimeIdx, endTimeIdx));
+        }
+        if (lMask != null) {
+            out[3] = lMask.get(NDArrayIndex.all(),
+                    NDArrayIndex.interval(startTimeIdx, endTimeIdx));
+        }
+
+        return out;
+    }
+
     public void updateRnnStateWithTBPTTState() {
         for (int i = 0; i < layers.length; i++) {
             if (layers[i] instanceof RecurrentLayer) {
@@ -1331,10 +1536,12 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
     /** Equivalent to backprop(), but calculates gradient for truncated BPTT instead. */
     protected void truncatedBPTTGradient() {
-        if (flattenedGradients == null)
+        synchronizeIterEpochCounts();
+        if (flattenedGradients == null) {
             initGradientsView();
+        }
         String multiGradientKey;
-        gradient = new DefaultGradient();
+        gradient = new DefaultGradient(flattenedGradients);
         Layer currLayer;
 
         if (!(getOutputLayer() instanceof IOutputLayer)) {
@@ -1345,7 +1552,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         IOutputLayer outputLayer = (IOutputLayer) getOutputLayer();
         if (labels == null)
             throw new IllegalStateException("No labels found");
-        if (outputLayer.conf().getLayer().getWeightInit() == WeightInit.ZERO) {
+        if (outputLayer instanceof BaseLayer
+                        && ((BaseLayer) outputLayer.conf().getLayer()).getWeightInit() == WeightInit.ZERO) {
             throw new IllegalStateException("Output layer weights cannot be initialized to zero when using backprop.");
         }
 
@@ -1400,11 +1608,19 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
     /**
      *
-     * @return
+     * @return listeners
      */
     public Collection<IterationListener> getListeners() {
         return listeners;
     }
+
+    /**
+    *
+    * @return trainingListeners
+    */
+   public Collection<TrainingListener> getTrainingListeners() {
+       return trainingListeners;
+   }
 
     @Override
     public void setListeners(Collection<IterationListener> listeners) {
@@ -1431,6 +1647,29 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         }
     }
 
+    /**
+     * This method ADDS additional IterationListener to existing listeners
+     *
+     * @param listeners
+     */
+    @Override
+    public void addListeners(IterationListener... listeners) {
+        if (this.listeners == null) {
+            setListeners(listeners);
+            return;
+        }
+
+        for (IterationListener listener : listeners) {
+            this.listeners.add(listener);
+            if (listener instanceof TrainingListener) {
+                this.trainingListeners.add((TrainingListener) listener);
+            }
+        }
+
+        if (solver != null) {
+            solver.setListeners(this.listeners);
+        }
+    }
 
     @Override
     public void setListeners(IterationListener... listeners) {
@@ -1459,8 +1698,9 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             log.warn("Output layer not instance of output layer returning.");
             return;
         }
-        if (flattenedGradients == null)
+        if (flattenedGradients == null) {
             initGradientsView();
+        }
 
         if (labels == null)
             throw new IllegalStateException("No labels found");
@@ -1555,12 +1795,24 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         }
         update(TaskUtils.buildTask(features, labels));
 
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationExternal, workspaceExternal);
+
+        MemoryWorkspace cache =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        ComputationGraph.workspaceConfigurationCache,
+                                                        ComputationGraph.workspaceCache);
+
         if (layerWiseConfigurations.isPretrain()) {
-            pretrain(features);
+            try (MemoryWorkspace wsCache = cache.notifyScopeEntered()) {
+                try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
+                    pretrain(features);
+                }
+            }
         }
-
-
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal,workspaceExternal);
 
         if (layerWiseConfigurations.isBackprop()) {
             if (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT) {
@@ -1571,8 +1823,11 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
                         solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this).build();
                     }
                 }
-                try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
-                    solver.optimize();
+
+                try (MemoryWorkspace wsCache = cache.notifyScopeEntered()) {
+                    try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
+                        solver.optimize();
+                    }
                 }
             }
         }
@@ -1613,21 +1868,21 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      */
     @Override
     public void fit(org.nd4j.linalg.dataset.api.DataSet data) {
-            if (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT) {
+        if (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT) {
 
-                    doTruncatedBPTT(data.getFeatures(), data.getLabels(), data.getFeaturesMaskArray(),
+            doTruncatedBPTT(data.getFeatures(), data.getLabels(), data.getFeaturesMaskArray(),
                             data.getLabelsMaskArray());
 
-            } else {
-                //Standard training
-                boolean hasMaskArrays = data.hasMaskArrays();
-                if (hasMaskArrays)
-                    setLayerMaskArrays(data.getFeaturesMaskArray(), data.getLabelsMaskArray());
-                fit(data.getFeatures(), data.getLabels());
-                if (hasMaskArrays)
-                    clearLayerMaskArrays();
+        } else {
+            //Standard training
+            boolean hasMaskArrays = data.hasMaskArrays();
+            if (hasMaskArrays)
+                setLayerMaskArrays(data.getFeaturesMaskArray(), data.getLabelsMaskArray());
+            fit(data.getFeatures(), data.getLabels());
+            if (hasMaskArrays)
+                clearLayerMaskArrays();
 
-            }
+        }
 
         clearLayersStates();
     }
@@ -1683,18 +1938,26 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     public INDArray output(INDArray input, boolean train) {
         WorkspaceMode cMode = layerWiseConfigurations.getTrainingWorkspaceMode();
         layerWiseConfigurations.setTrainingWorkspaceMode(layerWiseConfigurations.getInferenceWorkspaceMode());
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal, workspaceExternal);
+        MemoryWorkspace workspace =
+                layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                        workspaceConfigurationExternal, workspaceExternal);
 
-        try(MemoryWorkspace wsE = workspace.notifyScopeEntered()) {
-            INDArray ret = silentOutput(input, train).detach();
+        INDArray ret = null;
+        try (MemoryWorkspace wsE = workspace.notifyScopeEntered()) {
+            ret = silentOutput(input, train).detach();
 
             layerWiseConfigurations.setTrainingWorkspaceMode(cMode);
-            return ret;
+            clearLayersStates();    //Ensure INDArrays in layer input fields don't leak out of workspace (via .input() etc)
         }
+
+        layerWiseConfigurations.setTrainingWorkspaceMode(cMode);
+        return ret;
     }
 
     protected INDArray silentOutput(INDArray input, boolean train) {
-        List<INDArray> activations = feedForward(input, train);
+        setInput(input);
+        List<INDArray> activations = feedForwardToLayer(layers.length-1, train, false);
 
         //last activation is output
         return activations.get(activations.size() - 1);
@@ -1707,9 +1970,12 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     public INDArray output(INDArray input, boolean train, INDArray featuresMask, INDArray labelsMask) {
         WorkspaceMode cMode = layerWiseConfigurations.getTrainingWorkspaceMode();
         layerWiseConfigurations.setTrainingWorkspaceMode(layerWiseConfigurations.getInferenceWorkspaceMode());
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal, workspaceExternal);
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationExternal, workspaceExternal);
 
-        try(MemoryWorkspace wsE = workspace.notifyScopeEntered()) {
+        try (MemoryWorkspace wsE = workspace.notifyScopeEntered()) {
             INDArray ret = silentOutput(input, train, featuresMask, labelsMask).detach();
 
             layerWiseConfigurations.setTrainingWorkspaceMode(cMode);
@@ -1895,11 +2161,15 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         if (hasMaskArray)
             setLayerMaskArrays(data.getFeaturesMaskArray(), data.getLabelsMaskArray());
 
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal,workspaceExternal);
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationExternal, workspaceExternal);
 
         try (MemoryWorkspace ws = workspace.notifyScopeEntered()) {
             // activation for output layer is calculated in computeScore
-            List<INDArray> activations = feedForwardToLayer(layers.length - 2, data.getFeatureMatrix(), training);
+            setInput(data.getFeatures());
+            List<INDArray> activations = feedForwardToLayer(layers.length - 2, training, false);    //Don't clear layers, as this clears mask arrays also
             int n = activations.size();
             setLabels(data.getLabels());
             if (getOutputLayer() instanceof IOutputLayer) {
@@ -1920,6 +2190,7 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
         if (hasMaskArray)
             clearLayerMaskArrays();
+        clearLayersStates();
 
         return score();
     }
@@ -1945,7 +2216,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         boolean hasMaskArray = data.hasMaskArrays();
         if (hasMaskArray)
             setLayerMaskArrays(data.getFeaturesMaskArray(), data.getLabelsMaskArray());
-        feedForward(data.getFeatureMatrix(), false);
+        setInput(data.getFeatures());
+        feedForwardToLayer(layers.length-1, false, false);
         setLabels(data.getLabels());
 
         INDArray out;
@@ -1993,46 +2265,73 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
     @Override
     public void computeGradientAndScore() {
-        //Calculate activations (which are stored in each layer, and used in backprop)
-        if (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT) {
-            List<INDArray> activations = rnnActivateUsingStoredState(getInput(), true, true);
-            if (trainingListeners.size() > 0) {
-                for (TrainingListener tl : trainingListeners) {
-                    tl.onForwardPass(this, activations);
-                }
+
+        //Initialize the workspace (should be a no-op most of the time - but is necessary here if user calls
+        // computeGradientAndScore() before any fit() methods)
+        MemoryWorkspace wsExternal = null;
+        boolean shouldCloseWorkspace = false;
+        if(layerWiseConfigurations.getTrainingWorkspaceMode() != WorkspaceMode.NONE) {
+            wsExternal = Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal, workspaceExternal);
+            if(!wsExternal.isScopeActive()){
+                wsExternal.notifyScopeEntered();
+                shouldCloseWorkspace = true;
             }
-            truncatedBPTTGradient();
-        } else {
-            //First: do a feed-forward through the network
-            //Note that we don't actually need to do the full forward pass through the output layer right now; but we do
-            // need the input to the output layer to be set (such that backprop can be done)
-            List<INDArray> activations = feedForwardToLayer(layers.length - 2, true);
-            if (trainingListeners.size() > 0) {
-                //TODO: We possibly do want output layer activations in some cases here...
-                for (TrainingListener tl : trainingListeners) {
-                    tl.onForwardPass(this, activations);
-                }
-            }
-            INDArray actSecondLastLayer = activations.get(activations.size() - 1);
-            if (layerWiseConfigurations.getInputPreProcess(layers.length - 1) != null)
-                actSecondLastLayer = layerWiseConfigurations.getInputPreProcess(layers.length - 1)
-                                .preProcess(actSecondLastLayer, getInputMiniBatchSize());
-            getOutputLayer().setInput(actSecondLastLayer);
-            //Then: compute gradients
-            backprop();
         }
 
-        //Calculate score
-        if (!(getOutputLayer() instanceof IOutputLayer)) {
-            throw new IllegalStateException(
-                            "Cannot calculate gradient and score with respect to labels: final layer is not an IOutputLayer");
-        }
-        score = ((IOutputLayer) getOutputLayer()).computeScore(calcL1(true), calcL2(true), true);
+        try {
 
-        //Listeners
-        if (trainingListeners.size() > 0) {
-            for (TrainingListener tl : trainingListeners) {
-                tl.onBackwardPass(this);
+            //Calculate activations (which are stored in each layer, and used in backprop)
+            if (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT) {
+                List<INDArray> activations = rnnActivateUsingStoredState(getInput(), true, true);
+                if (trainingListeners.size() > 0) {
+                    for (TrainingListener tl : trainingListeners) {
+                        tl.onForwardPass(this, activations);
+                    }
+                }
+                truncatedBPTTGradient();
+            } else {
+                synchronizeIterEpochCounts();
+
+                //First: do a feed-forward through the network
+                //Note that we don't actually need to do the full forward pass through the output layer right now; but we do
+                // need the input to the output layer to be set (such that backprop can be done)
+                List<INDArray> activations = feedForwardToLayer(layers.length - 2, true, false);
+                if (trainingListeners.size() > 0) {
+                    //TODO: We possibly do want output layer activations in some cases here...
+                    for (TrainingListener tl : trainingListeners) {
+                        tl.onForwardPass(this, activations);
+                    }
+                }
+                INDArray actSecondLastLayer = activations.get(activations.size() - 1);
+                if (layerWiseConfigurations.getInputPreProcess(layers.length - 1) != null)
+                    actSecondLastLayer = layerWiseConfigurations.getInputPreProcess(layers.length - 1)
+                            .preProcess(actSecondLastLayer, getInputMiniBatchSize());
+                getOutputLayer().setInput(actSecondLastLayer);
+                //Then: compute gradients
+                backprop();
+            }
+
+            //Calculate score
+            if (!(getOutputLayer() instanceof IOutputLayer)) {
+                throw new DL4JException(
+                        "Cannot calculate gradient and score with respect to labels: final layer is not an IOutputLayer");
+            }
+            score = ((IOutputLayer) getOutputLayer()).computeScore(calcL1(true), calcL2(true), true);
+
+            //Listeners
+            if (trainingListeners.size() > 0) {
+                try (MemoryWorkspace workspace = Nd4j.getMemoryManager().scopeOutOfWorkspaces()) {
+                    for (TrainingListener tl : trainingListeners) {
+                        tl.onBackwardPass(this);
+                    }
+                }
+            }
+
+            //Clear the post noise/dropconnect parameters on the output layer
+            getOutputLayer().clearNoiseWeightParams();
+        } finally {
+            if(shouldCloseWorkspace){
+                wsExternal.notifyScopeLeft();
             }
         }
     }
@@ -2054,40 +2353,11 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
         solver = null;
     }
 
-    /**
-     * Averages the given logistic regression
-     * from a mini batch in to this one
-     *
-     * @param layer     the logistic regression to average in to this one
-     * @param batchSize the batch size
-     * @deprecated Not supported and not used
-     */
     @Override
-    @Deprecated
-    public void merge(Layer layer, int batchSize) {
-        throw new UnsupportedOperationException();
-    }
-
-    /**
-     * Deprecated: Merges this network with the other one.
-     *
-     * @param network   the network to merge with
-     * @param batchSize the batch size (number of training examples)
-     *                  to average by
-     * @deprecated As of 0.7.3 - Feb 2017. No longer used; parameter averaging is performed via alternative means/methods
-     */
-    @Deprecated
-    public void merge(MultiLayerNetwork network, int batchSize) {
-        if (network.layers.length != layers.length)
-            throw new IllegalArgumentException("Unable to merge networks that are not of equal length");
-        for (int i = 0; i < getnLayers(); i++) {
-            Layer n = layers[i];
-            Layer otherNetwork = network.layers[i];
-            n.merge(otherNetwork, batchSize);
-
+    public void applyConstraints(int iteration, int epoch) {
+        for(Layer l : layers){
+            l.applyConstraints(iteration, epoch);
         }
-
-        getOutputLayer().merge(network.getOutputLayer(), batchSize);
     }
 
 
@@ -2132,18 +2402,6 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      */
     public void setParameters(INDArray params) {
         setParams(params);
-    }
-
-    @Override
-    public void applyLearningRateScoreDecay() {
-        for (Layer layer : layers) {
-            if (!layer.conf().getLearningRateByParam().isEmpty()) {
-                for (Map.Entry<String, Double> lrPair : layer.conf().getLearningRateByParam().entrySet()) {
-                    layer.conf().setLearningRateByParam(lrPair.getKey(),
-                                    lrPair.getValue() * (layer.conf().getLrPolicyDecayRate() + Nd4j.EPS_THRESHOLD));
-                }
-            }
-        }
     }
 
     public NeuralNetConfiguration getDefaultConfiguration() {
@@ -2218,6 +2476,13 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     }
 
     @Override
+    public void clearNoiseWeightParams() {
+        for(Layer l : layers){
+            l.clearNoiseWeightParams();
+        }
+    }
+
+    @Override
     public Pair<INDArray, MaskState> feedForwardMaskArray(INDArray maskArray, MaskState currentMaskState,
                     int minibatchSize) {
         if (maskArray == null) {
@@ -2260,23 +2525,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     //Layer methods
 
     @Override
-    public Gradient error(INDArray errorSignal) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public Type type() {
         return Type.MULTILAYER;
-    }
-
-    @Override
-    public INDArray derivativeActivation(INDArray input) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public Gradient calcGradient(Gradient layerError, INDArray activation) {
-        throw new UnsupportedOperationException();
     }
 
     @Override
@@ -2330,6 +2580,26 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
     @Override
     public int getIndex() {
         return layerIndex;
+    }
+
+    @Override
+    public int getIterationCount() {
+        return getLayerWiseConfigurations().getIterationCount();
+    }
+
+    @Override
+    public int getEpochCount() {
+        return getLayerWiseConfigurations().getEpochCount();
+    }
+
+    @Override
+    public void setIterationCount(int iterationCount) {
+        getLayerWiseConfigurations().setIterationCount(iterationCount);
+    }
+
+    @Override
+    public void setEpochCount(int epochCount) {
+        getLayerWiseConfigurations().setEpochCount(epochCount);
     }
 
     @Override
@@ -2641,7 +2911,6 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      * Perform evaluation using an arbitrary IEvaluation instance.
      *
      * @param iterator   data to evaluate on
-     * @param evaluation IEvaluation instance to perform evaluation with
      */
     public <T extends IEvaluation> T[] doEvaluation(DataSetIterator iterator, T... evaluations) {
         if (!iterator.hasNext() && iterator.resetSupported()) {
@@ -2650,7 +2919,21 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
         DataSetIterator iter = iterator.asyncSupported() ? new AsyncDataSetIterator(iterator, 2, true) : iterator;
 
-        MemoryWorkspace workspace = layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace() : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(workspaceConfigurationExternal,workspaceExternal);
+        WorkspaceMode cMode = layerWiseConfigurations.getTrainingWorkspaceMode();
+        layerWiseConfigurations.setTrainingWorkspaceMode(layerWiseConfigurations.getInferenceWorkspaceMode());
+
+        MemoryWorkspace workspace =
+                        layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                                        : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                                                        workspaceConfigurationExternal, workspaceExternal);
+
+        //First: let's determine if we should do 'split feed forward' for long time series
+        //The idea: RNN 20k time steps. Train using TBPTT length 100 -> 200 segments of length 100. If we naively
+        // just use .output(INDArray) here, then our memory requirements are 200x larger than if we did the same
+        // evaluation in segments...
+        //Only do this if TBPTT is enabled - if not, it means we can train without TBPTT and hence should be able
+        // to test without splitting also
+        boolean useRnnSegments = (layerWiseConfigurations.getBackpropType() == BackpropType.TruncatedBPTT);
 
         while (iter.hasNext()) {
             DataSet next = iter.next();
@@ -2658,22 +2941,59 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             if (next.getFeatureMatrix() == null || next.getLabels() == null)
                 break;
 
+            MemoryWorkspace workspaceT =
+                    layerWiseConfigurations.getTrainingWorkspaceMode() == WorkspaceMode.NONE ? new DummyWorkspace()
+                            : Nd4j.getWorkspaceManager().getWorkspaceForCurrentThread(
+                            workspaceConfigurationTBPTT, workspaceTBPTT);
+
             try (MemoryWorkspace wsB = workspace.notifyScopeEntered()) {
 
                 INDArray features = next.getFeatures();
                 INDArray labels = next.getLabels();
+                INDArray fMask = next.getFeaturesMaskArray();
                 INDArray lMask = next.getLabelsMaskArray();
 
-                INDArray out;
-                if (next.hasMaskArrays()) {
-                    INDArray fMask = next.getFeaturesMaskArray();
-                    out = this.silentOutput(features, false, fMask, lMask);
-                } else {
-                    out = this.silentOutput(features, false);
-                }
 
-                for(T evaluation: evaluations)
-                evaluation.eval(labels, out, lMask);
+
+                if(!useRnnSegments){
+                    //Standard/non-RNN case:
+                    INDArray out;
+                    if (next.hasMaskArrays()) {
+                        out = this.silentOutput(features, false, fMask, lMask);
+                    } else {
+                        out = this.silentOutput(features, false);
+                    }
+
+                    try (MemoryWorkspace wsO = Nd4j.getWorkspaceManager().scopeOutOfWorkspaces()) {
+                        for (T evaluation : evaluations)
+                            evaluation.eval(labels, out, lMask);
+                    }
+                } else {
+                    rnnClearPreviousState();
+
+
+                    //Get subset of features and labels:
+                    int fwdLen = layerWiseConfigurations.getTbpttFwdLength();
+                    int tsLength = features.size(2);
+                    int nSubsets = tsLength / fwdLen;
+                    if (tsLength % fwdLen != 0)
+                        nSubsets++; //Example: 100 fwdLen with timeSeriesLength=120 -> want 2 subsets (1 of size 100, 1 of size 20)
+                    for (int i = 0; i < nSubsets; i++) {
+                        int startTimeIdx = i * fwdLen;
+                        int endTimeIdx = Math.min(startTimeIdx + fwdLen, tsLength);
+                        INDArray[] subsets = getSubsetsForTbptt(startTimeIdx, endTimeIdx, features, labels, fMask, lMask);
+
+                        try (MemoryWorkspace wsT = workspaceT.notifyScopeEntered()) {
+                            setLayerMaskArrays(subsets[2], subsets[3]);
+
+                            INDArray outSub = rnnTimeStep(subsets[0]);
+                            try (MemoryWorkspace wsO = Nd4j.getWorkspaceManager().scopeOutOfWorkspaces()) {
+                                for (T evaluation : evaluations)
+                                    evaluation.eval(subsets[1], outSub, subsets[3]);
+                            }
+                        }
+                    }
+                }
             }
 
             clearLayerMaskArrays();
@@ -2681,6 +3001,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
         if (iterator.asyncSupported())
             ((AsyncDataSetIterator) iter).shutdown();
+
+        layerWiseConfigurations.setTrainingWorkspaceMode(cMode);
 
         return evaluations;
     }
@@ -2693,6 +3015,45 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      */
     public Evaluation evaluate(DataSetIterator iterator, List<String> labelsList) {
         return evaluate(iterator, labelsList, 1);
+    }
+
+    @Override
+    public INDArray updaterState() {
+        return getUpdater() != null ? getUpdater().getStateViewArray() : null;
+    }
+
+    @Override
+    public void fit(MultiDataSet dataSet) {
+        if (dataSet.getFeatures().length == 1 && dataSet.getLabels().length == 1) {
+            INDArray features = null;
+            INDArray labels = null;
+            INDArray fMask = null;
+            INDArray lMask = null;
+
+            if (dataSet.getFeaturesMaskArrays() != null)
+                fMask = dataSet.getFeaturesMaskArrays()[0];
+
+            if (dataSet.getFeaturesMaskArrays() != null)
+                lMask = dataSet.getLabelsMaskArrays()[0];
+
+            features = dataSet.getFeatures()[0];
+            labels = dataSet.getLabels()[0];
+
+            DataSet ds = new DataSet(features, labels, fMask, lMask);
+            fit(ds);
+        }
+        throw new DL4JInvalidInputException(
+                        "MultiLayerNetwork can't handle MultiDataSet. Please consider use of ComputationGraph");
+    }
+
+    @Override
+    public void fit(MultiDataSetIterator iterator) {
+        fit(new MultiDataSetWrapperIterator(iterator));
+    }
+
+    @Override
+    public <T extends IEvaluation> T[] doEvaluation(MultiDataSetIterator iterator, T[] evaluations) {
+        return doEvaluation(new MultiDataSetWrapperIterator(iterator), evaluations);
     }
 
     /**
@@ -2716,8 +3077,8 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
 
         return e;
     }
-
-    private void update(Task task) {
+    
+    protected void update(Task task) {
         if (!initDone) {
             initDone = true;
             Heartbeat heartbeat = Heartbeat.getInstance();
@@ -2734,27 +3095,62 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      * @return Summary as a string
      */
     public String summary() {
+        return summary(null);
+    }
+
+    /**
+     * String detailing the architecture of the multilayernetwork.
+     * Will also display activation size when given an input type.
+     * Columns are LayerIndex with layer type, nIn, nOut, Total number of parameters, Shapes of the parameters, Input activation shape, Output activation shape
+     * Will also give information about frozen layers, if any.
+     * @return Summary as a string
+     */
+    public String summary(InputType inputType) {
         String ret = "\n";
-        ret += StringUtils.repeat("=", 140);
+        ret += StringUtils.repeat("=", 250);
         ret += "\n";
-        ret += String.format("%-40s%-15s%-15s%-30s\n", "LayerName (LayerType)", "nIn,nOut", "TotalParams",
-                        "ParamsShape");
-        ret += StringUtils.repeat("=", 140);
+        if (inputType != null) {
+            ret += String.format("%-40s%-10s%-12s%-40s%-75s%-75s\n", "LayerName (LayerType)", "nIn,nOut", "TotalParams",
+                    "ParamsShape","InputShape", "OutputShape");
+        }
+        else {
+            ret += String.format("%-40s%-10s%-12s%-40s\n", "LayerName (LayerType)", "nIn,nOut", "TotalParams",
+                    "ParamsShape");
+        }
+        ret += StringUtils.repeat("=", 250);
         ret += "\n";
         int frozenParams = 0;
-        for (Layer currentLayer : layers) {
-            String name = String.valueOf(currentLayer.getIndex());
+        for (org.deeplearning4j.nn.api.Layer currentLayer : getLayers()) {
+            String name = currentLayer.conf().getLayer().getLayerName();
+            if (name == null) {
+                name = String.valueOf(currentLayer.getIndex());
+            }
             String paramShape = "-";
             String in = "-";
             String out = "-";
             String[] classNameArr = currentLayer.getClass().getName().split("\\.");
             String className = classNameArr[classNameArr.length - 1];
             String paramCount = String.valueOf(currentLayer.numParams());
+            String inShape = "";
+            String outShape = "";
+            InputPreProcessor preProcessor;
+            InputType outType;
+            if (inputType != null) {
+                preProcessor = getLayerWiseConfigurations().getInputPreProcess(currentLayer.getIndex());
+                inShape = inputType.toString();
+                if (preProcessor != null) {
+                    inputType = preProcessor.getOutputType(inputType);
+                    inShape += "--> "+ inputType.toString();
+                }
+                outType = currentLayer.conf().getLayer().getOutputType(currentLayer.getIndex(), inputType);
+                outShape = outType.toString();
+                inputType = outType;
+            }
             if (currentLayer.numParams() > 0) {
                 paramShape = "";
                 in = String.valueOf(((FeedForwardLayer) currentLayer.conf().getLayer()).getNIn());
                 out = String.valueOf(((FeedForwardLayer) currentLayer.conf().getLayer()).getNOut());
-                Set<String> paraNames = currentLayer.conf().getLearningRateByParam().keySet();
+                Set<String> paraNames = currentLayer.paramTable().keySet();
                 for (String aP : paraNames) {
                     String paramS = ArrayUtils.toString(currentLayer.paramTable().get(aP).shape());
                     paramShape += aP + ":" + paramS + ", ";
@@ -2766,16 +3162,22 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
                 classNameArr = ((FrozenLayer) currentLayer).getInsideLayer().getClass().getName().split("\\.");
                 className = "Frozen " + classNameArr[classNameArr.length - 1];
             }
-            ret += String.format("%-40s%-15s%-15s%-30s", name + " (" + className + ")", in + "," + out, paramCount,
-                            paramShape);
+            if (inputType!= null) {
+                ret += String.format("%-40s%-10s%-12s%-40s%-75s%-75s", name + " (" + className + ")", in + "," + out, paramCount,
+                        paramShape,inShape,outShape);
+            }
+            else {
+                ret += String.format("%-40s%-12s%-10s%-40s", name + " (" + className + ")", in + "," + out, paramCount,
+                        paramShape);
+            }
             ret += "\n";
         }
-        ret += StringUtils.repeat("-", 140);
+        ret += StringUtils.repeat("-", 250);
         ret += String.format("\n%30s %d", "Total Parameters: ", params().length());
         ret += String.format("\n%30s %d", "Trainable Parameters: ", params().length() - frozenParams);
         ret += String.format("\n%30s %d", "Frozen Parameters: ", frozenParams);
         ret += "\n";
-        ret += StringUtils.repeat("=", 140);
+        ret += StringUtils.repeat("=", 250);
         ret += "\n";
         return ret;
     }
@@ -2789,6 +3191,141 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
             layers[f].setMaskArray(null);
             layers[f].clear();
         }
+    }
+
+    /**
+     * Increment the epoch count (in the underlying {@link MultiLayerConfiguration} by 1).
+     * Note that this is done <i>automatically</i> when using iterator-based fitting methods, such as
+     * {@link #fit(DataSetIterator)}. However, when using non-iterator fit methods (DataSet, INDArray/INDArray etc),
+     * the network has no way to know when one epoch ends and another starts. In such situations, this method
+     * can be used to increment the epoch counter.<br>
+     * Note that the epoch counter is used for situations such as some learning rate schedules, and the like.
+     *
+     * The current epoch count can be obtained using {@code MultiLayerConfiguration.getLayerwiseConfiguration().getEpochCount()}
+     */
+    public void incrementEpochCount(){
+        layerWiseConfigurations.setEpochCount(layerWiseConfigurations.getEpochCount() + 1);
+    }
+
+
+    protected void synchronizeIterEpochCounts(){
+        //TODO: this is necessrry for some schedules - but the redundant values are a little ugly...
+        int currIter = getIterationCount();
+        int currEpoch = getEpochCount();
+        for(Layer l : layers){
+            l.setIterationCount(currIter);
+            l.setEpochCount(currEpoch);
+        }
+    }
+
+    /**
+     * Save the MultiLayerNetwork to a file. Restore using {@link #load(File, boolean)}.
+     * Note that this saves the updater (i.e., the state array for momentum/Adam/rmsprop etc), which is desirable
+     * if further training will be undertaken.
+     *
+     * @param f File to save the network to
+     * @see ModelSerializer ModelSerializer for more details (and saving/loading via streams)
+     * @see #save(File, boolean)
+     */
+    public void save( File f ) throws IOException {
+        save(f, true);
+    }
+
+    /**
+     * Save the MultiLayerNetwork to a file. Restore using {@link #load(File, boolean)}.
+     *
+     * @param f File to save the network to
+     * @param saveUpdater If true: save the updater (i.e., the state array for momentum/Adam/rmsprop etc), which should
+     *                    usually be saved if further training is required
+     * @see ModelSerializer ModelSerializer for more details (and saving/loading via streams)
+     * @see #save(File, boolean)
+     */
+    public void save(File f, boolean saveUpdater) throws IOException{
+        ModelSerializer.writeModel(this, f, saveUpdater);
+    }
+
+    /**
+     * Restore a MultiLayerNetwork to a file, saved using {@link #save(File)} or {@link ModelSerializer}
+     * @param f File to load the network from
+     * @param loadUpdater If true: load the updater if it is available (i.e., the state array for momentum/Adam/rmsprop
+     *                   etc) - use <i>false</i> if no further training is required, or <i>true</i> if further training
+     *                    will be undertaken
+     * @see ModelSerializer ModelSerializer for more details (and saving/loading via streams)
+     */
+    public static MultiLayerNetwork load(File f, boolean loadUpdater) throws IOException {
+        return ModelSerializer.restoreMultiLayerNetwork(f, loadUpdater);
+    }
+
+    /**
+     * Convert this MultiLayerNetwork to a ComputationGraph
+     *
+     * @return ComputationGraph equivalent to this network (including parameters and updater state)
+     */
+    public ComputationGraph toComputationGraph(){
+        return NetworkUtils.toComputationGraph(this);
+    }
+
+    /**
+     * Set the learning rate for all layers in the network to the specified value. Note that if any learning rate
+     * schedules are currently present, these will be removed in favor of the new (fixed) learning rate.<br>
+     * <br>
+     * <b>Note</b>: <i>This method not free from a performance point of view</i>: a proper learning rate schedule
+     * should be used in preference to calling this method at every iteration.
+     *
+     * @param newLr New learning rate for all layers
+     * @see #setLearningRate(ISchedule)
+     * @see #setLearningRate(int, double)
+     */
+    public void setLearningRate(double newLr){
+        NetworkUtils.setLearningRate(this, newLr);
+    }
+
+    /**
+     * Set the learning rate schedule for all layers in the network to the specified schedule.
+     * This schedule will replace any/all existing schedules, and also any fixed learning rate values.<br>
+     * Note that the iteration/epoch counts will <i>not</i> be reset. Use {@link MultiLayerConfiguration#setIterationCount(int)}
+     * and {@link MultiLayerConfiguration#setEpochCount(int)} if this is required
+     *
+     * @param newLr New learning rate schedule for all layers
+     * @see #setLearningRate(ISchedule)
+     * @see #setLearningRate(int, double)
+     */
+    public void setLearningRate(ISchedule newLr){
+        NetworkUtils.setLearningRate(this, newLr);
+    }
+
+    /**
+     * Set the learning rate for a single layer in the network to the specified value. Note that if any learning rate
+     * schedules are currently present, these will be removed in favor of the new (fixed) learning rate.<br>
+     * <br>
+     * <b>Note</b>: <i>This method not free from a performance point of view</i>: a proper learning rate schedule
+     * should be used in preference to calling this method at every iteration. Note also that
+     * {@link #setLearningRate(double)} should also be used in preference, when all layers need to be set to a new LR
+     *
+     * @param layerNumber Number of the layer to set the LR for
+     * @param newLr New learning rate for a single layer
+     * @see #setLearningRate(ISchedule)
+     * @see #setLearningRate(int, double)
+     */
+    public void setLearningRate(int layerNumber, double newLr){
+        NetworkUtils.setLearningRate(this, layerNumber, newLr);
+    }
+
+    /**
+     * Set the learning rate schedule for a single layer in the network to the specified value.<br>
+     * Note also that {@link #setLearningRate(ISchedule)} should also be used in preference, when all layers need
+     * to be set to a new LR schedule.<br>
+     * This schedule will replace any/all existing schedules, and also any fixed learning rate values.<br>
+     * Note also that the iteration/epoch counts will <i>not</i> be reset. Use {@link MultiLayerConfiguration#setIterationCount(int)}
+     * and {@link MultiLayerConfiguration#setEpochCount(int)} if this is required
+     *
+     * @param layerNumber Number of the layer to set the LR schedule for
+     * @param newLr New learning rate for a single layer
+     * @see #setLearningRate(ISchedule)
+     * @see #setLearningRate(int, double)
+     */
+    public void setLearningRate(int layerNumber, ISchedule newLr){
+        NetworkUtils.setLearningRate(this, layerNumber, newLr);
     }
 
     /**
@@ -2839,9 +3376,9 @@ public class MultiLayerNetwork implements Serializable, Classifier, Layer {
      */
     @Override
     public boolean equals(Object obj) {
-        if(obj == null)
+        if (obj == null)
             return false;
-        if(obj instanceof MultiLayerNetwork) {
+        if (obj instanceof MultiLayerNetwork) {
             MultiLayerNetwork network = (MultiLayerNetwork) obj;
             boolean paramsEquals = network.params().equals(params());
             boolean confEquals = getLayerWiseConfigurations().equals(network.getLayerWiseConfigurations());

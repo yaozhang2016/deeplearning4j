@@ -20,11 +20,17 @@ package org.deeplearning4j.eval;
 
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.Multiset;
+import lombok.Getter;
 
 import java.io.Serializable;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ConfusionMatrix<T extends Comparable<? super T>> implements Serializable {
+    @Getter
     private volatile Map<T, Multiset<T>> matrix;
     private List<T> classes;
 
@@ -32,11 +38,13 @@ public class ConfusionMatrix<T extends Comparable<? super T>> implements Seriali
      * Creates an empty confusion Matrix
      */
     public ConfusionMatrix(List<T> classes) {
-        this.matrix = Collections.synchronizedMap(new HashMap<T, Multiset<T>>());
+        this.matrix = new ConcurrentHashMap<>();
         this.classes = classes;
     }
 
-    public ConfusionMatrix() {}
+    public ConfusionMatrix() {
+        this(new ArrayList<T>());
+    }
 
     /**
      * Creates a new ConfusionMatrix initialized with the contents of another ConfusionMatrix.
@@ -83,6 +91,8 @@ public class ConfusionMatrix<T extends Comparable<? super T>> implements Seriali
      * Gives the applyTransformToDestination of all classes in the confusion matrix.
      */
     public List<T> getClasses() {
+        if (classes == null)
+            classes = new ArrayList<>();
         return classes;
     }
 

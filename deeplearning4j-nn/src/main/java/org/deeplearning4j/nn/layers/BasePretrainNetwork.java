@@ -19,7 +19,6 @@
 package org.deeplearning4j.nn.layers;
 
 
-import org.deeplearning4j.berkeley.Pair;
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
 import org.deeplearning4j.nn.gradient.DefaultGradient;
 import org.deeplearning4j.nn.gradient.Gradient;
@@ -29,6 +28,7 @@ import org.deeplearning4j.optimize.api.TrainingListener;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.factory.Nd4j;
 import org.nd4j.linalg.lossfunctions.ILossFunction;
+import org.nd4j.linalg.primitives.Pair;
 
 import java.util.*;
 
@@ -195,7 +195,7 @@ public abstract class BasePretrainNetwork<LayerConfT extends org.deeplearning4j.
 
         if (params.length() != paramLength) {
             throw new IllegalArgumentException("Unable to set parameters: must be of length " + paramLength
-                    + ", got params of length " + params.length() + " " + layerId());
+                            + ", got params of length " + params.length() + " " + layerId());
         }
 
         // Set for backprop and only W & hb
@@ -212,14 +212,15 @@ public abstract class BasePretrainNetwork<LayerConfT extends org.deeplearning4j.
         INDArray vBiasGradient = gradientViews.get(PretrainParamInitializer.VISIBLE_BIAS_KEY);
         result.getFirst().gradientForVariable().put(PretrainParamInitializer.VISIBLE_BIAS_KEY, vBiasGradient);
         vBiasGradient.assign(0);
+
+        weightNoiseParams.clear();
+
         return result;
     }
 
 
     @Override
     public double calcL2(boolean backpropParamsOnly) {
-        if (!conf.isUseRegularization())
-            return 0.0;
         double l2Sum = super.calcL2(true);
         if (backpropParamsOnly)
             return l2Sum;
@@ -232,8 +233,6 @@ public abstract class BasePretrainNetwork<LayerConfT extends org.deeplearning4j.
 
     @Override
     public double calcL1(boolean backpropParamsOnly) {
-        if (!conf.isUseRegularization())
-            return 0.0;
         double l1Sum = super.calcL1(true);
         if (conf.getL1ByParam(PretrainParamInitializer.VISIBLE_BIAS_KEY) > 0) {
             l1Sum += conf.getL1ByParam(PretrainParamInitializer.VISIBLE_BIAS_KEY)

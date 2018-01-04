@@ -5,7 +5,6 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
-import org.deeplearning4j.berkeley.Counter;
 import org.deeplearning4j.models.embeddings.WeightLookupTable;
 import org.deeplearning4j.models.embeddings.inmemory.InMemoryLookupTable;
 import org.deeplearning4j.models.embeddings.reader.ModelUtils;
@@ -16,8 +15,7 @@ import org.deeplearning4j.util.SetUtils;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.factory.Nd4j;
 import org.nd4j.linalg.ops.transforms.Transforms;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.nd4j.linalg.primitives.Counter;
 
 import java.util.*;
 
@@ -141,9 +139,9 @@ public class BasicModelUtils<T extends SequenceElement> implements ModelUtils<T>
                 String predicted = split[3];
                 String w = wordsNearest(positive, negative, 1).iterator().next();
                 if (predicted.equals(w))
-                    right.incrementCount(CORRECT, 1.0);
+                    right.incrementCount(CORRECT, 1.0f);
                 else
-                    right.incrementCount(WRONG, 1.0);
+                    right.incrementCount(WRONG, 1.0f);
 
             }
         }
@@ -199,7 +197,7 @@ public class BasicModelUtils<T extends SequenceElement> implements ModelUtils<T>
         List<String> realResults = new ArrayList<>();
 
         for (String word : tempRes) {
-            if (!positive.contains(word) && !negative.contains(negative) && realResults.size() < top)
+            if (!positive.contains(word) && !negative.contains(word) && realResults.size() < top)
                 realResults.add(word);
         }
 
@@ -266,11 +264,11 @@ public class BasicModelUtils<T extends SequenceElement> implements ModelUtils<T>
         for (String s : vocabCache.words()) {
             INDArray otherVec = lookupTable.vector(s);
             double sim = Transforms.cosineSim(words, otherVec);
-            distances.incrementCount(s, sim);
+            distances.incrementCount(s, (float) sim);
         }
 
 
-        distances.keepTopNKeys(top);
+        distances.keepTopNElements(top);
         return distances.keySet();
 
 
@@ -347,10 +345,10 @@ public class BasicModelUtils<T extends SequenceElement> implements ModelUtils<T>
         for (String s : vocabCache.words()) {
             INDArray otherVec = lookupTable.vector(s);
             double sim = Transforms.cosineSim(words, otherVec);
-            distances.incrementCount(s, sim);
+            distances.incrementCount(s, (float) sim);
         }
 
-        distances.keepTopNKeys(top);
+        distances.keepTopNElements(top);
         return distances.keySet();
     }
 

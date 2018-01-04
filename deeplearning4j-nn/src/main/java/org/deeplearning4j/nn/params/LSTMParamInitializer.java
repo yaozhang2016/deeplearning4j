@@ -21,6 +21,8 @@ package org.deeplearning4j.nn.params;
 import org.deeplearning4j.nn.api.ParamInitializer;
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
 import org.deeplearning4j.nn.conf.distribution.Distributions;
+import org.deeplearning4j.nn.conf.layers.LSTM;
+import org.deeplearning4j.nn.conf.layers.Layer;
 import org.deeplearning4j.nn.weights.WeightInitUtil;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.api.rng.distribution.Distribution;
@@ -28,9 +30,7 @@ import org.nd4j.linalg.factory.Nd4j;
 import org.nd4j.linalg.indexing.INDArrayIndex;
 import org.nd4j.linalg.indexing.NDArrayIndex;
 
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
 
 /**LSTM Parameter initializer, for LSTM based on
  * Graves: Supervised Sequence Labelling with Recurrent Neural Networks
@@ -51,8 +51,12 @@ public class LSTMParamInitializer implements ParamInitializer {
 
     @Override
     public int numParams(NeuralNetConfiguration conf) {
-        org.deeplearning4j.nn.conf.layers.LSTM layerConf =
-                        (org.deeplearning4j.nn.conf.layers.LSTM) conf.getLayer();
+        return numParams(conf.getLayer());
+    }
+
+    @Override
+    public int numParams(Layer l) {
+        LSTM layerConf = (LSTM) l;
 
         int nL = layerConf.getNOut(); //i.e., n neurons in this layer
         int nLast = layerConf.getNIn(); //i.e., n neurons in previous layer
@@ -65,10 +69,34 @@ public class LSTMParamInitializer implements ParamInitializer {
     }
 
     @Override
+    public List<String> paramKeys(Layer layer) {
+        return Arrays.asList(INPUT_WEIGHT_KEY, RECURRENT_WEIGHT_KEY, BIAS_KEY);
+    }
+
+    @Override
+    public List<String> weightKeys(Layer layer) {
+        return Arrays.asList(INPUT_WEIGHT_KEY, RECURRENT_WEIGHT_KEY);
+    }
+
+    @Override
+    public List<String> biasKeys(Layer layer) {
+        return Collections.singletonList(BIAS_KEY);
+    }
+
+    @Override
+    public boolean isWeightParam(Layer layer, String key) {
+        return RECURRENT_WEIGHT_KEY.equals(key) || INPUT_WEIGHT_KEY.equals(key);
+    }
+
+    @Override
+    public boolean isBiasParam(Layer layer, String key) {
+        return BIAS_KEY.equals(key);
+    }
+
+    @Override
     public Map<String, INDArray> init(NeuralNetConfiguration conf, INDArray paramsView, boolean initializeParams) {
         Map<String, INDArray> params = Collections.synchronizedMap(new LinkedHashMap<String, INDArray>());
-        org.deeplearning4j.nn.conf.layers.LSTM layerConf =
-                        (org.deeplearning4j.nn.conf.layers.LSTM) conf.getLayer();
+        org.deeplearning4j.nn.conf.layers.LSTM layerConf = (org.deeplearning4j.nn.conf.layers.LSTM) conf.getLayer();
         double forgetGateInit = layerConf.getForgetGateBiasInit();
 
         Distribution dist = Distributions.createDistribution(layerConf.getDist());
@@ -127,8 +155,7 @@ public class LSTMParamInitializer implements ParamInitializer {
 
     @Override
     public Map<String, INDArray> getGradientsFromFlattened(NeuralNetConfiguration conf, INDArray gradientView) {
-        org.deeplearning4j.nn.conf.layers.LSTM layerConf =
-                        (org.deeplearning4j.nn.conf.layers.LSTM) conf.getLayer();
+        org.deeplearning4j.nn.conf.layers.LSTM layerConf = (org.deeplearning4j.nn.conf.layers.LSTM) conf.getLayer();
 
         int nL = layerConf.getNOut(); //i.e., n neurons in this layer
         int nLast = layerConf.getNIn(); //i.e., n neurons in previous layer

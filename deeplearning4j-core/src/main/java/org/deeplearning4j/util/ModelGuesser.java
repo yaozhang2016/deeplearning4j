@@ -75,7 +75,8 @@ public class ModelGuesser {
                             try {
                                 return ComputationGraphConfiguration.fromYaml(input);
                             } catch (Exception e5) {
-                                throw e5;
+                                throw new ModelGuesserException("Unable to load configuration from path " + path
+                                        + " (invalid config file or not a known config type)");
                             }
                         }
                     }
@@ -122,10 +123,10 @@ public class ModelGuesser {
                 log.warn("Tried computation graph");
                 try {
                     return ModelSerializer.restoreMultiLayerNetwork(new File(path), false);
-                }catch(Exception e4) {
+                } catch (Exception e4) {
                     try {
                         return ModelSerializer.restoreComputationGraph(new File(path), false);
-                    }catch(Exception e5) {
+                    } catch (Exception e5) {
                         try {
                             return KerasModelImport.importKerasModelAndWeights(path);
                         } catch (Exception e2) {
@@ -134,7 +135,8 @@ public class ModelGuesser {
                                 return KerasModelImport.importKerasSequentialModelAndWeights(path);
 
                             } catch (Exception e3) {
-                                throw e3;
+                                throw new ModelGuesserException("Unable to load model from path " + path
+                                        + " (invalid model file or not a known model type)");
                             }
                         }
                     }
@@ -156,36 +158,19 @@ public class ModelGuesser {
      * @throws Exception
      */
     public static Model loadModelGuess(InputStream stream) throws Exception {
-        try {
-            return ModelSerializer.restoreMultiLayerNetwork(stream, true);
-        } catch (Exception e) {
-            try {
-                return ModelSerializer.restoreComputationGraph(stream, true);
-            } catch (Exception e1) {
-                try {
-                    return ModelSerializer.restoreMultiLayerNetwork(stream, false);
+        //Currently (Nov 2017): KerasModelImport doesn't support loading from input streams
+        //Simplest solution here: write to a temporary file
+        File f = File.createTempFile("loadModelGuess",".bin");
+        f.deleteOnExit();
 
-                }catch(Exception e5) {
-                    try {
-                        return ModelSerializer.restoreComputationGraph(stream, false);
-
-                    }catch(Exception e6) {
-                        try {
-                            return KerasModelImport.importKerasModelAndWeights(stream);
-                        } catch (Exception e2) {
-                            try {
-                                return KerasModelImport.importKerasSequentialModelAndWeights(stream);
-
-                            } catch (Exception e3) {
-                                throw e3;
-                            }
-                        }
-                    }
-
-                }
-
-
-            }
+        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(f))) {
+            IOUtils.copy(stream, os);
+            os.flush();
+            return loadModelGuess(f.getAbsolutePath());
+        } catch (ModelGuesserException e){
+            throw new ModelGuesserException("Unable to load model from input stream (invalid model file not a known model type)");
+        } finally {
+            f.delete();
         }
     }
 

@@ -1,9 +1,9 @@
 package org.deeplearning4j.models.embeddings.reader.impl;
 
-import org.deeplearning4j.berkeley.Counter;
 import org.deeplearning4j.models.sequencevectors.sequence.SequenceElement;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.ops.transforms.Transforms;
+import org.nd4j.linalg.primitives.Counter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,10 +51,10 @@ public class FlatModelUtils<T extends SequenceElement> extends BasicModelUtils<T
         for (String s : vocabCache.words()) {
             INDArray otherVec = lookupTable.vector(s);
             double sim = Transforms.cosineSim(Transforms.unitVec(words.dup()), Transforms.unitVec(otherVec.dup()));
-            distances.incrementCount(s, sim);
+            distances.incrementCount(s, (float) sim);
         }
 
-        distances.keepTopNKeys(top);
-        return distances.getSortedKeys();
+        distances.keepTopNElements(top);
+        return distances.keySetSorted();
     }
 }

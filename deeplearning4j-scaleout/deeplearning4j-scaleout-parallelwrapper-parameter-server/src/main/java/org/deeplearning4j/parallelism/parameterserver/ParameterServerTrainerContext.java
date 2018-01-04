@@ -60,7 +60,7 @@ public class ParameterServerTrainerContext implements TrainerContext {
      * @return the created training instance
      */
     @Override
-    public Trainer create(int threadId, Model model, int rootDevice, boolean useMDS, ParallelWrapper wrapper,
+    public Trainer create(String uuid, int threadId, Model model, int rootDevice, boolean useMDS, ParallelWrapper wrapper,
                     WorkspaceMode mode, int averagingFrequency) {
         return ParameterServerTrainer.builder().originalModel(model).parameterServerClient(ParameterServerClient
                         .builder().aeron(parameterServerNode.getAeron())
@@ -70,5 +70,15 @@ public class ParameterServerTrainerContext implements TrainerContext {
                         .subscriberHost("localhost").masterStatusHost("localhost").masterStatusPort(statusServerPort)
                         .subscriberPort(40625 + threadId).subscriberStream(12 + threadId).build())
                         .replicatedModel(model).threadId(threadId).parallelWrapper(wrapper).useMDS(useMDS).build();
+    }
+
+    @Override
+    public void finalizeRound(Model originalModel, Model... models) {
+        // no-op
+    }
+
+    @Override
+    public void finalizeTraining(Model originalModel, Model... models) {
+        // no-op
     }
 }

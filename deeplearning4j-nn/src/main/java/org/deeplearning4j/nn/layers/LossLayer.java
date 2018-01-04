@@ -19,10 +19,8 @@
 package org.deeplearning4j.nn.layers;
 
 
-import org.deeplearning4j.berkeley.Pair;
 import org.deeplearning4j.eval.Evaluation;
 import org.deeplearning4j.nn.api.Layer;
-import org.deeplearning4j.nn.api.Updater;
 import org.deeplearning4j.nn.api.layers.IOutputLayer;
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
 import org.deeplearning4j.nn.gradient.DefaultGradient;
@@ -33,6 +31,7 @@ import org.nd4j.linalg.dataset.api.DataSet;
 import org.nd4j.linalg.dataset.api.iterator.DataSetIterator;
 import org.nd4j.linalg.factory.Nd4j;
 import org.nd4j.linalg.lossfunctions.ILossFunction;
+import org.nd4j.linalg.primitives.Pair;
 import org.nd4j.linalg.util.FeatureUtil;
 
 import java.io.Serializable;
@@ -187,9 +186,7 @@ public class LossLayer extends BaseLayer<org.deeplearning4j.nn.conf.layers.LossL
     @Override
     public INDArray activate(boolean training) {
         INDArray z = input;
-        //INDArray ret = Nd4j.getExecutioner().execAndReturn(Nd4j.getOpFactory().createTransform(
-        //    conf.getLayer().getActivationFunction(), z.dup(), conf.getExtraArgs() ));
-        INDArray ret = conf.getLayer().getActivationFn().getActivation(z.dup(), training);
+        INDArray ret = layerConf().getActivationFn().getActivation(z.dup(), training);
 
         if (maskArray != null) {
             ret.muliColumnVector(maskArray);
@@ -249,17 +246,6 @@ public class LossLayer extends BaseLayer<org.deeplearning4j.nn.conf.layers.LossL
     @Override
     public boolean isPretrainLayer() {
         return false;
-    }
-
-
-    @Override
-    public Gradient calcGradient(Gradient layerError, INDArray indArray) {
-        throw new UnsupportedOperationException("Not supported " + layerId());
-    }
-
-    @Override
-    public void merge(Layer layer, int batchSize) {
-        throw new UnsupportedOperationException("Not supported " + layerId());
     }
 
     @Override
@@ -363,19 +349,7 @@ public class LossLayer extends BaseLayer<org.deeplearning4j.nn.conf.layers.LossL
      */
     @Override
     public void fit(INDArray input, INDArray labels) {
-        setInput(input);
-        setLabels(labels);
-        applyDropOutIfNecessary(true);
-        if (solver == null) {
-            solver = new Solver.Builder().configure(conf()).listeners(getListeners()).model(this).build();
-            //Set the updater state view array. For MLN and CG, this is done by MultiLayerUpdater and ComputationGraphUpdater respectively
-            Updater updater = solver.getOptimizer().getUpdater();
-            int updaterStateSize = (int)conf().getLayer().getIUpdater().stateSize(numParams());
-            if (updaterStateSize > 0)
-                updater.setStateViewArray(this, Nd4j.createUninitialized(new int[] {1, updaterStateSize}, Nd4j.order()),
-                                true);
-        }
-        solver.optimize();
+        throw new UnsupportedOperationException("LossLayer has no parameters and cannot be fit");
     }
 
     /**

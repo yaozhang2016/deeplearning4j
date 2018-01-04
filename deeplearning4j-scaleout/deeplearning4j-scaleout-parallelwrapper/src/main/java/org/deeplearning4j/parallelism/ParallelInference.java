@@ -8,18 +8,17 @@ import org.deeplearning4j.nn.conf.MultiLayerConfiguration;
 import org.deeplearning4j.nn.graph.ComputationGraph;
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.deeplearning4j.parallelism.inference.InferenceMode;
+import org.deeplearning4j.parallelism.inference.InferenceObservable;
 import org.deeplearning4j.parallelism.inference.observers.BasicInferenceObservable;
 import org.deeplearning4j.parallelism.inference.observers.BasicInferenceObserver;
-import org.deeplearning4j.parallelism.inference.InferenceObservable;
 import org.deeplearning4j.parallelism.inference.observers.BatchedInferenceObservable;
 import org.nd4j.linalg.api.ndarray.INDArray;
-import org.nd4j.linalg.api.ops.executioner.GridExecutioner;
 import org.nd4j.linalg.dataset.DataSet;
 import org.nd4j.linalg.factory.Nd4j;
 
-import java.util.List;
 import java.util.Observer;
-import java.util.concurrent.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -62,9 +61,20 @@ public class ParallelInference {
     protected void init() {
         observables = new LinkedBlockingQueue<>(queueLimit);
 
+        int numDevices = Nd4j.getAffinityManager().getNumberOfDevices();
+        int currentDevice = Nd4j.getAffinityManager().getDeviceForCurrentThread();
+        AtomicBoolean assignedRoot = new AtomicBoolean(false);
+
         zoo = new InferenceWorker[workers];
         for (int i = 0; i < workers; i++) {
-            zoo[i] = new InferenceWorker(i, model, observables);
+            int cDevice = i % numDevices;
+            boolean cRoot = !assignedRoot.get() && cDevice == currentDevice;
+            assignedRoot.compareAndSet(false, cRoot);
+
+            zoo[i] = new InferenceWorker(i, model, observables, cRoot);
+
+            Nd4j.getAffinityManager().attachThreadToDevice(zoo[i], cDevice);
+            zoo[i].setDaemon(true);
             zoo[i].start();
         }
 
@@ -182,7 +192,6 @@ public class ParallelInference {
 
 
 
-
         /**
          * This method defines, how many model copies will be used for inference.
          *
@@ -264,13 +273,16 @@ public class ParallelInference {
         private Model protoModel;
         private Model replicatedModel;
         private AtomicLong counter = new AtomicLong(0);
+        private boolean rootDevice;
 
-        private InferenceWorker(int id, @NonNull Model model, @NonNull BlockingQueue inputQueue) {
+        private InferenceWorker(int id, @NonNull Model model, @NonNull BlockingQueue inputQueue, boolean rootDevice) {
             this.inputQueue = inputQueue;
             this.protoModel = model;
+            this.rootDevice = rootDevice;
 
             this.setDaemon(true);
             this.setName("InferenceThread-" + id);
+
         }
 
         protected long getCounterValue() {
@@ -282,24 +294,32 @@ public class ParallelInference {
             try {
                 // model should be replicated & initialized here
                 if (protoModel instanceof ComputationGraph) {
-                    this.replicatedModel = new ComputationGraph(ComputationGraphConfiguration
-                                    .fromJson(((ComputationGraph) protoModel).getConfiguration().toJson()));
-                    this.replicatedModel.init();
+                    if (!rootDevice) {
+                        this.replicatedModel = new ComputationGraph(ComputationGraphConfiguration
+                                        .fromJson(((ComputationGraph) protoModel).getConfiguration().toJson()));
+                        this.replicatedModel.init();
 
-                    synchronized (locker) {
-                        this.replicatedModel.setParams(protoModel.params());
+                        synchronized (locker) {
+                            this.replicatedModel.setParams(protoModel.params().unsafeDuplication(true));
 
-                        Nd4j.getExecutioner().commit();
+                            Nd4j.getExecutioner().commit();
+                        }
+                    } else {
+                        this.replicatedModel = protoModel;
                     }
                 } else if (protoModel instanceof MultiLayerNetwork) {
-                    this.replicatedModel = new MultiLayerNetwork(MultiLayerConfiguration
-                                    .fromJson(((MultiLayerNetwork) protoModel).getLayerWiseConfigurations().toJson()));
-                    this.replicatedModel.init();
+                    if (!rootDevice) {
+                        this.replicatedModel = new MultiLayerNetwork(MultiLayerConfiguration.fromJson(
+                                        ((MultiLayerNetwork) protoModel).getLayerWiseConfigurations().toJson()));
+                        this.replicatedModel.init();
 
-                    synchronized (locker) {
-                        this.replicatedModel.setParams(protoModel.params());
+                        synchronized (locker) {
+                            this.replicatedModel.setParams(protoModel.params().unsafeDuplication(true));
 
-                        Nd4j.getExecutioner().commit();
+                            Nd4j.getExecutioner().commit();
+                        }
+                    } else {
+                        this.replicatedModel = protoModel;
                     }
                 }
 

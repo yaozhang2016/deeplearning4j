@@ -1,14 +1,10 @@
 package org.deeplearning4j.nn.layers.convolution;
 
-import lombok.Data;
-import lombok.EqualsAndHashCode;
-import lombok.NoArgsConstructor;
-import lombok.ToString;
-import org.deeplearning4j.berkeley.Pair;
 import org.deeplearning4j.exception.DL4JInvalidInputException;
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
 import org.deeplearning4j.nn.gradient.Gradient;
 import org.nd4j.linalg.api.ndarray.INDArray;
+import org.nd4j.linalg.primitives.Pair;
 
 import java.util.Arrays;
 
@@ -43,8 +39,7 @@ public class Convolution1DLayer extends ConvolutionLayer {
             throw new DL4JInvalidInputException("Got rank " + epsilon.rank()
                             + " array as epsilon for Convolution1DLayer backprop with shape "
                             + Arrays.toString(epsilon.shape())
-                            + ". Expected rank 3 array with shape [minibatchSize, features, length]. "
-                            + layerId());
+                            + ". Expected rank 3 array with shape [minibatchSize, features, length]. " + layerId());
 
         // add singleton fourth dimension to input and next layer's epsilon
         epsilon = epsilon.reshape(epsilon.size(0), epsilon.size(1), epsilon.size(2), 1);
@@ -63,7 +58,7 @@ public class Convolution1DLayer extends ConvolutionLayer {
     }
 
     @Override
-    protected Pair<INDArray,INDArray> preOutput4d(boolean training, boolean forBackprop) {
+    protected Pair<INDArray, INDArray> preOutput4d(boolean training, boolean forBackprop) {
         return super.preOutput(true, forBackprop);
     }
 
